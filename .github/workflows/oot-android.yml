@@ -69,7 +69,11 @@ jobs:
           # Change only the play variant's application ID, not its runtime behavior.
           assert s.count("applicationId nxLive ? 'dev.bananative.android' : nxPlay ? " + old) == 1
           s = s.replace("applicationId nxLive ? 'dev.bananative.android' : nxPlay ? " + old,
-                        "applicationId nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.nxnative.android.ootdebug'")
+                        "applicationId nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.kaminofilms.bananative.ootfix'")
+          old_label = "resValue 'string', 'app_name', nxPlay || nxLive ? 'Banana Native' : nxApp ? nxLabel : 'Banana Native test'"
+          new_label = "resValue 'string', 'app_name', nxPlay ? 'Banana OOT Fix' : nxLive ? 'Banana Native' : nxApp ? nxLabel : 'Banana Native test'"
+          assert s.count(old_label) == 1
+          s = s.replace(old_label, new_label)
           p.write_text(s)
           PY
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > upstream/android/app/local.properties
@@ -99,7 +103,7 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1 -PnxVersionCode=3 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1-side -PnxVersionCode=4 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
@@ -108,7 +112,14 @@ jobs:
           cp input-sha256.txt deliverables/ 2>/dev/null || true
           test -f upstream/android/app/out/nxnative-android-play.apk
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs upstream/android/app/out/nxnative-android-play.apk > deliverables/apk-signature.txt
-          cp upstream/android/app/out/nxnative-android-play.apk deliverables/
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging upstream/android/app/out/nxnative-android-play.apk > deliverables/apk-info.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          info = Path('deliverables/apk-info.txt').read_text()
+          assert "package: name='dev.kaminofilms.bananative.ootfix'" in info, info[:500]
+          assert "application-label:'Banana OOT Fix'" in info, info[:500]
+          PY
+          cp upstream/android/app/out/nxnative-android-play.apk deliverables/Banana-OOT-Fix.apk
           tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
           cp README.md deliverables/
           cp patches/README.md deliverables/CANDIDATE-NOTES.md
@@ -116,7 +127,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: banana-oot-depth-candidate
+          name: banana-oot-side-by-side
           path: deliverables/
           retention-days: 14
           if-no-files-found: error

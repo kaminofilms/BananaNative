@@ -24,19 +24,18 @@ or forced environment setting is changed. Existing compatible shader libraries
 and this custom application's pipeline cache can be reused. An official app's
 private cache is separate. No save migration or deletion is performed.
 
-Package: dev.nxnative.android.ootdebug, same as the previous custom baseline.
-Uses an explicit custom keystore path cached by Actions (banana-oot-signing-v2).
-The old cache did not save a key, so this candidate's certificate is different
-from earlier custom builds; an in-place update over those builds is not promised. It cannot update the official release;
-an update over a custom build also requires matching signing certificates.
-Keep existing app data and saves. Version: 0.2.4-depth1, versionCode 3.
+Package: dev.kaminofilms.bananative.ootfix; app label: Banana OOT Fix.
+This is a separate installation alongside the official app and all earlier
+ootdebug custom builds. It does not need their signing keys or uninstalling them.
+The logs provider authority follows the new application ID.
+Version: 0.2.4-depth1-side, versionCode 4. Uses the cached custom signing key.
+The APK's actual package ID and label are checked with aapt before publication.
+
+Android gives this app its own data folder. Existing saves and shader libraries
+are not automatically shared; use the app's supported export/import to reuse
+them. Nothing in this change deletes or modifies the original app's files.
 
 Validation:
-- The production depth-state helper is compiled and exercised over 64 combinations
-  of paired/unpaired, test on/off, write on/off, and the eight depth comparisons.
-- Related specialization and shader ABI tests run in the workflow.
-- No phone is connected here: system-driver and Turnip gameplay, before/after
-  screenshots, memory usage, and crash behavior require device verification.
-- Local host tests could not build without clang; Metal graphics tests require
-  Apple's xcrun. The full Python suite has environment-related failures; only
-  the explicitly reported focused suite is passing.
+- The focused depth and shader tests run in the workflow.
+- The APK signature, package ID and app label are checked after compiling.
+- Device installation and gameplay remain unverified here.
