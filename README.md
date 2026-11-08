@@ -1,9 +1,11 @@
-# Banana Native — Ocarina Android diagnostics
+# Banana Native — Ocarina Android investigation
 
-Unofficial diagnostic builds for Ocarina of Time on Android. Not a verified graphics fix and not affiliated with Nintendo, NVIDIA, Qualcomm, or Banana Native's maintainers.
+The current workflow rebuilds upstream v0.2.4 with the official play-mode behavior, default supported profiles and unchanged renderer/shader translator. It removes the earlier diagnostic environment defaults. This is a baseline to investigate a gameplay crash, not a verified lighting fix.
 
-The Actions workflow builds the Ocarina host from upstream v0.2.4 and reuses the matching official APK's embedded preparation runtime. It installs separately as `dev.nxnative.android.ootdebug`, preserving the official app. Add your own game to the test app; saves and prepared packs are not automatically shared.
+The only app identity change is the separate package `dev.nxnative.android.ootdebug`; the official app stays installed. Signing is unofficial, so this is not byte-identical to the official APK. The matching official APK supplies the on-device preparation runtime, verified by its published SHA-256.
 
-Diagnostics enable texture-binding logging for the merge and fog shaders and disable asynchronous pipeline skipping. Expect slower diagnostic runs and larger logs. Use Share log after reproducing the problem.
+Reuse prepared shaders: in the official app, Manage → Export pack to a folder in Download. In this app, add the same game then Manage → Import pack. Import saves separately. The Vulkan driver pipeline cache is separate and may warm up again. Do not choose Prepare again unless the pack compatibility check requires it.
 
-No games, keys, user logs, or saves are included. Artifacts include the APK and exact source used to build it, including upstream license notices. Upstream: https://git.eden-emu.dev/moceure/BananaNative
+The first diagnostic build used a temporary signing key. The current workflow caches its debug key for subsequent builds. If Android rejects this update due to a different signature, first export any needed saves and pack from the diagnostic app, then reinstall only that diagnostic app. Keep the official app installed.
+
+Artifacts contain the APK and matching build source with upstream license notices. No games, keys, user logs or saves are uploaded. Not affiliated with Nintendo, NVIDIA, Qualcomm or Banana Native maintainers. Upstream: https://git.eden-emu.dev/moceure/BananaNative
