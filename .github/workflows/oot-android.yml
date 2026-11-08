@@ -1,0 +1,83 @@
+name: Ocarina Android diagnostic APK
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oot-android.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android toolchain
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+      - name: Fetch upstream source and matching preparation runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 180 -o upstream.zip https://git.eden-emu.dev/moceure/BananaNative/archive/v0.2.4.zip
+          curl --fail --location --retry 3 --max-time 180 -o official.apk https://git.eden-emu.dev/moceure/BananaNative/releases/download/v0.2.4/banana-native-v0.2.4.apk
+          echo "972ad854455727531ef70440179954e26054ee253555b6c05dfd7c3c7b9f38b5  official.apk" | sha256sum --check
+          sha256sum upstream.zip official.apk > input-sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+          with zipfile.ZipFile('upstream.zip') as z:
+              z.extractall('source')
+          roots = list(Path('source').glob('*/android/app/build.gradle'))
+          assert len(roots) == 1, roots
+          root = roots[0].parents[2]
+          root.rename('upstream')
+          stage = Path('pack-stage')
+          (stage/'lib').mkdir(parents=True)
+          with zipfile.ZipFile('official.apk') as z:
+              for name in ['libpython3.14.so','libnxpack.so','libzbicdec.so','libdmsh_xlate.so','libSPIRV-Tools-shared.so']:
+                  (stage/'lib'/name).write_bytes(z.read('lib/arm64-v8a/'+name))
+              from io import BytesIO
+              with zipfile.ZipFile(BytesIO(z.read('assets/pack/python.zip'))) as py:
+                  py.extractall(stage/'python')
+          assert (stage/'python/lib/python3.14/os.py').is_file()
+          PY
+      - name: Add targeted diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/android/app/src/main/java/dev/nxnative/android/Prefs.java')
+          s = p.read_text()
+          old = 'return of(c).getString(gameKey("env", titleId), "");'
+          assert s.count(old) == 1, 'Upstream preferences changed; review before patching'
+          defaults = 'DM_VK_PSO_ASYNC=0\\nDM_VK_TEX_PEEK=9b310b3349825e9a,5b2bb0924ecc403b\\nDM_VK_TEX_PEEK_LINES=800'
+          new = 'return of(c).getString(gameKey("env", titleId), "0400486024DEC000".equals(titleId) ? "' + defaults + '" : "");'
+          p.write_text(s.replace(old, new))
+          PY
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > upstream/android/app/local.properties
+          chmod +x upstream/android/app/gradlew
+      - name: Build separate test APK
+        working-directory: upstream/android/app
+        run: ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxApp=ootdebug "-PnxLabel=Banana OOT Diagnostics" -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+      - name: Package build sources and notices
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p deliverables
+          cp input-sha256.txt deliverables/ 2>/dev/null || true
+          find upstream/android/app/out -maxdepth 1 -name '*.apk' -exec cp {} deliverables/ \; 2>/dev/null || true
+          tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
+          cp README.md deliverables/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: banana-oot-diagnostics
+          path: deliverables/
+          retention-days: 14
+          if-no-files-found: error
