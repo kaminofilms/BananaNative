@@ -17,6 +17,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install Android toolchain
         run: sdkmanager "platforms;android-36" "build-tools;35.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
       - name: Fetch upstream source and matching preparation runtime
@@ -66,7 +68,7 @@ jobs:
         working-directory: upstream/android/app
         run: ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxApp=ootdebug "-PnxLabel=Banana OOT Diagnostics" -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
-        if: always()
+        if: success()
         shell: bash
         run: |
           mkdir -p deliverables
@@ -75,7 +77,7 @@ jobs:
           tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
           cp README.md deliverables/
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: banana-oot-diagnostics
           path: deliverables/
