@@ -83,13 +83,14 @@
      { int tb = VKA_ENV("DM_VK_ENC_TAIL", 16384); atomic_store_explicit(&g_tail_every, tb <= 0 ? 0 : tb > (1 << 20) ? (1u << 20) : (uint32_t)tb, memory_order_relaxed); }   // live: from this submission
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_rtdump.c
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,272 @@
 +// DM_VK_RTDUMP: a frame's render targets as small PNG previews, for finding the pass that makes a picture wrong without a desktop GPU debugger (Android, restart).
 +//   DM_VK_RTDUMP=<frame>         dump that frame (vka_frame numbering, as in the log's [longframe] lines)
 +//   DM_VK_RTDUMP=@<seconds>      dump the first frame that starts that many seconds after the replay's first frame (frame rates vary on the phone)
 +//   DM_VK_RTDUMP_FRAMES=<n>      dump n frames in a row (default 1)
 +//   DM_VK_RTDUMP_PX=<n>          the previews' longer side (default 512; colour targets are scaled on the GPU with a linear blit, depth on the CPU)
 +//   DM_VK_RTDUMP_MAX=<n>         the most images written in the run (default 400)
++//   DM_VK_RTDUMP_DIR=<dir>       the folder written into instead of $DM_TEMP/rtdump (a shared folder such as /storage/emulated/0/Download/rtdump, which the app can write with all-files access)
 +// After every render pass of the frame, each colour attachment (the level and layer the pass drew) and its depth attachment; after every compute dispatch, the float
 +// storage images it bound (level 0, layer 0). Each is read back after its submission completes and written to $DM_TEMP/rtdump/f<frame>/ as
 +//   <seq>_<p|d><pass>_s<serial>_<vkformat>_<w>x<h>_<first fragment or compute key>.png
@@ -270,9 +271,10 @@
 +    mkdir(b, 0775);
 +}
 +static void write_job(const job *j) {
-+    const char *tmp = getenv("DM_TEMP"); if (!tmp) tmp = "/data/local/tmp";
++    const char *tmp = getenv("DM_TEMP"), *od = getenv("DM_VK_RTDUMP_DIR"); if (!tmp) tmp = "/data/local/tmp";
 +    char dir[512], path[640];
-+    snprintf(dir, sizeof dir, "%s/rtdump/f%llu", tmp, (unsigned long long)j->frame); mkdirs(dir);
++    if (od && *od) snprintf(dir, sizeof dir, "%s/f%llu", od, (unsigned long long)j->frame); else snprintf(dir, sizeof dir, "%s/rtdump/f%llu", tmp, (unsigned long long)j->frame);
++    mkdirs(dir);
 +    snprintf(path, sizeof path, "%s/%04u_%c%03u_s%llu_%d_%ux%u_%016llx.png", dir, j->seq, j->kind, j->pass, (unsigned long long)j->serial, (int)j->vf, j->w, j->h, (unsigned long long)j->key);
 +    uint32_t ow = j->depth ? j->w : j->sw, oh = j->depth ? j->h : j->sh, step = 1;
 +    if (j->depth) { uint32_t m = ow > oh ? ow : oh; while (m / step > (uint32_t)g_px) step++; }
