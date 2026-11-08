@@ -1,4 +1,4 @@
-name: Ocarina Android diagnostic APK
+name: Banana official-behavior baseline APK
 on:
   push:
     branches: [main]
@@ -48,25 +48,30 @@ jobs:
                   py.extractall(stage/'python')
           assert (stage/'python/lib/python3.14/os.py').is_file()
           PY
-      - name: Add targeted diagnostics
+      - name: Match official play behavior with a separate package
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('upstream/android/app/src/main/java/dev/nxnative/android/Prefs.java')
+          p = Path('upstream/android/app/build.gradle')
           s = p.read_text()
-          old = 'return of(c).getString(gameKey("env", titleId), "");'
-          assert s.count(old) == 1, 'Upstream preferences changed; review before patching'
-          defaults = 'DM_VK_PSO_ASYNC=0\\nDM_VK_TEX_PEEK=9b310b3349825e9a,5b2bb0924ecc403b\\nDM_VK_TEX_PEEK_LINES=800'
-          new = 'return of(c).getString(gameKey("env", titleId), "0400486024DEC000".equals(titleId) ? "' + defaults + '" : "");'
-          p.write_text(s.replace(old, new))
+          old = "'dev.nxnative.android.play'"
+          # Change only the play variant's application ID, not its runtime behavior.
+          assert s.count("applicationId nxLive ? 'dev.bananative.android' : nxPlay ? " + old) == 1
+          s = s.replace("applicationId nxLive ? 'dev.bananative.android' : nxPlay ? " + old,
+                        "applicationId nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.nxnative.android.ootdebug'")
+          p.write_text(s)
           PY
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > upstream/android/app/local.properties
           chmod +x upstream/android/app/gradlew
-      - name: Build separate test APK
+      - uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: banana-oot-signing-v1
+      - name: Build official-behavior baseline APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxApp=ootdebug "-PnxLabel=Banana OOT Diagnostics" -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
@@ -79,7 +84,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: banana-oot-diagnostics
+          name: banana-oot-baseline
           path: deliverables/
           retention-days: 14
           if-no-files-found: error
