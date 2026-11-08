@@ -1,0 +1,356 @@
+--- a/dm/gfx/vk_android/vka.h
++++ b/dm/gfx/vk_android/vka.h
+@@ -469,6 +469,12 @@
+ void vka_rw_commit(uint64_t fence);          // the submission's copies, logged once fence is done
+ void vka_nan_dispatch(VkCommandBuffer cb, uint64_t key, vka_img *const *ims, int n);   // after a dispatch (its writes made visible): its float storage images, as a pass's attachments
+ void vka_nan_commit(uint64_t fence);
++// DM_VK_RTDUMP (vka_rtdump.c): a frame's render targets as PNG previews in $DM_TEMP/rtdump
++int vka_rtd_on(void);
++void vka_rtd_draw(uint64_t fs);
++void vka_rtd_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, const uint32_t *l0s, int n, vka_img *dim, uint32_t dlv, uint32_t dl0);
++void vka_rtd_dispatch(VkCommandBuffer cb, uint64_t key, vka_img *const *ims, int n);
++void vka_rtd_commit(uint64_t fence);
+ void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines);
+ int vka_is_ndve_key(uint64_t k);
+ 
+--- a/dm/gfx/vk_android/vka_draw.c
++++ b/dm/gfx/vk_android/vka_draw.c
+@@ -163,6 +163,7 @@
+     int on, classic; VkRect2D area; uint32_t layers, samples;   // classic: begun as a VkRenderPass (DM_VK_CLASSIC_RP)
+     uint32_t ncolor; VkFormat cf[8]; uint8_t ckind[8]; VkFormat df, sf;
+     vka_img *cim[8]; uint32_t clv[8], cl0[8]; int nci;   // the colour attachments (DM_VK_NANSCAN)
++    vka_img *dim; uint32_t dlv, dl0;                     // the depth attachment (DM_VK_RTDUMP)
+     p_set_rt rt; int has_rt;                             // the targets it was opened for: a later SET_RT of the same targets keeps it open
+     uint32_t cnl[8], dnl; VkExtent2D cext[8], dext;      // each attachment's layers and level size (clears in the pass must cover what they would outside it)
+     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
+@@ -305,6 +306,7 @@
+     bcrt_flush();        // block-compressed targets drawn through shadows: their blocks back (bcrt_attach)
+     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
+     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
++    if (vka_rtd_on()) vka_rtd_pass(g_cb, R.cim, R.clv, R.cl0, R.nci, R.dim, R.dlv, R.dl0);
+ }
+ static void rt_peek(const char *what, int i, const tex_t *t, const vka_img *im, uint32_t lv, uint32_t l0, uint32_t nl);   // DM_VK_TEX_PEEK
+ static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv, uint32_t *l0, uint32_t *nl);
+@@ -427,7 +429,7 @@
+                 da = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+                 if (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { dp = &da; R.df = im->f.vk; }
+                 if (im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sp = &da; R.sf = im->f.vk; }
+-                samples = im->samples; fb_im[nfb] = im; fb_lv[nfb++] = lv; s_im[8] = im; s_lv[8] = lv; s_nl[8] = nl;
++                samples = im->samples; fb_im[nfb] = im; fb_lv[nfb++] = lv; s_im[8] = im; s_lv[8] = lv; s_nl[8] = nl; R.dim = im; R.dlv = lv; R.dl0 = l0;
+                 uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
+                 R.dnl = nl; R.dext = (VkExtent2D){lw, lh};
+                 rt_peek("depth", 0, rt->depth, im, lv, l0, nl);
+@@ -1825,6 +1827,7 @@
+         if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
+     }
+     if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
++    if (vka_rtd_on()) vka_rtd_draw(fs ? fs->key : 0);
+     PT(5);
+     int istart = 0; uint32_t i_wv = 0, i_wp = 0; int64_t i_d = 0; vka_span i_ta = {0}, i_aa = {0};
+     if (ijoin || (icand && g_ia.valid)) {
+@@ -2249,6 +2252,11 @@
+         for (int i = 0; i < g_wk.n[5] && m < 32; i++) if (g_wk.r[5][i].what == VKA_R_IMG && g_wk.r[5][i].tid) ims[m++] = vka_tex_id_img(g_wk.r[5][i].tid, g_cb);
+         vka_nan_dispatch(g_cb, sh[5]->key, ims, m);
+     }
++    if (vka_rtd_on()) {   // DM_VK_RTDUMP: the storage images this dispatch wrote
++        vka_img *ims[32]; int m = 0;
++        for (int i = 0; i < g_wk.n[5] && m < 32; i++) if (g_wk.r[5][i].what == VKA_R_IMG && g_wk.r[5][i].tid) ims[m++] = vka_tex_id_img(g_wk.r[5][i].tid, g_cb);
++        vka_rtd_dispatch(g_cb, sh[5]->key, ims, m);
++    }
+     g_dispatches++;
+ }
+ void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines) {
+--- a/dm/gfx/vk_android/vka_exec.c
++++ b/dm/gfx/vk_android/vka_exec.c
+@@ -425,6 +425,7 @@
+     g_hrec[fence % NHREC].sub_ns = now_ns();
+     g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
+     if (vka_nan_on()) vka_nan_commit(fence);
++    if (vka_rtd_on()) vka_rtd_commit(fence);
+     vka_scratch_retire(fence);
+     if (r) {
+         static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("submission %llu: %d (its effects run without the GPU)", (unsigned long long)fence, r);
+--- a/dm/gfx/vk_android/vka_enc.c
++++ b/dm/gfx/vk_android/vka_enc.c
+@@ -485,7 +485,7 @@
+ void vka_enc_start(VkCommandBuffer cb) {
+     vka_enc_sync();
+     extern int vka_gp_active;
+-    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
++    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || vka_rtd_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
+     { int bt = VKA_ENV("DM_VK_ENC_BATCH", 4096); g_batch = bt < 0 ? 0 : bt > (1 << 20) ? (1 << 20) : (uint32_t)bt; }   // live: from this submission
+     { int us = VKA_ENV("DM_VK_ENC_SPIN", 200); atomic_store_explicit(&g_spin_ns, (uint64_t)(us < 0 ? 0 : us > 100000 ? 100000 : us) * 1000, memory_order_relaxed); }   // live: from this submission
+     { int tb = VKA_ENV("DM_VK_ENC_TAIL", 16384); atomic_store_explicit(&g_tail_every, tb <= 0 ? 0 : tb > (1 << 20) ? (1u << 20) : (uint32_t)tb, memory_order_relaxed); }   // live: from this submission
+--- /dev/null
++++ b/dm/gfx/vk_android/vka_rtdump.c
+@@ -0,0 +1,270 @@
++// DM_VK_RTDUMP: a frame's render targets as small PNG previews, for finding the pass that makes a picture wrong without a desktop GPU debugger (Android, restart).
++//   DM_VK_RTDUMP=<frame>         dump that frame (vka_frame numbering, as in the log's [longframe] lines)
++//   DM_VK_RTDUMP=@<seconds>      dump the first frame that starts that many seconds after the replay's first frame (frame rates vary on the phone)
++//   DM_VK_RTDUMP_FRAMES=<n>      dump n frames in a row (default 1)
++//   DM_VK_RTDUMP_PX=<n>          the previews' longer side (default 512; colour targets are scaled on the GPU with a linear blit, depth on the CPU)
++//   DM_VK_RTDUMP_MAX=<n>         the most images written in the run (default 400)
++// After every render pass of the frame, each colour attachment (the level and layer the pass drew) and its depth attachment; after every compute dispatch, the float
++// storage images it bound (level 0, layer 0). Each is read back after its submission completes and written to $DM_TEMP/rtdump/f<frame>/ as
++//   <seq>_<p|d><pass>_s<serial>_<vkformat>_<w>x<h>_<first fragment or compute key>.png
++// Colour: the raw values' statistics are logged (`rtdump` lines: per channel min, max and mean, and NaN / infinite counts), then the picture is exposed so its mean luminance is
++// 0.18, Reinhard-mapped and gamma-encoded (the game's own scale, 2^-EV, would otherwise leave it black). Depth: min..max of the level stretched to black..white, with the range logged.
++// Integer and block-compressed targets are skipped (logged once). Costs GPU and CPU time in the frames it dumps only; diagnostic, not for play.
++#if defined(__ANDROID__)
++#include "vka.h"
++#include <errno.h>
++#include <math.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <zlib.h>
++
++#define VLOG(...) LOG("[vk] " __VA_ARGS__)
++uint64_t vka_frame(void);
++
++static int g_init, g_on, g_px = 512, g_max = 400, g_nframes = 1;
++static long long g_frame0 = -1; static double g_at = -1; static uint64_t g_t0;
++static _Atomic int g_written, g_seq;
++static uint32_t g_pass;                                // render passes and dispatches of the dumped frames, in order
++static uint64_t g_fs[3]; static uint32_t g_nfs, g_ndraws;   // the pass's first fragment shader keys and its draws
++static uint64_t g_cur_frame = ~0ull;
++
++static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
++int vka_rtd_on(void) {
++    if (!g_init) {
++        g_init = 1;
++        const char *e = getenv("DM_VK_RTDUMP");
++        if (e && *e) {
++            if (*e == '@') g_at = strtod(e + 1, NULL); else g_frame0 = strtoll(e, NULL, 10);
++            const char *p = getenv("DM_VK_RTDUMP_PX"), *m = getenv("DM_VK_RTDUMP_MAX"), *n = getenv("DM_VK_RTDUMP_FRAMES");
++            if (p && atoi(p) >= 32) g_px = atoi(p);
++            if (m && atoi(m) > 0) g_max = atoi(m);
++            if (n && atoi(n) > 0) g_nframes = atoi(n);
++            g_on = g_at >= 0 || g_frame0 >= 0;
++            if (g_on) VLOG("DM_VK_RTDUMP: %s %s, %d frame(s), previews %d px, at most %d images, into $DM_TEMP/rtdump", g_at >= 0 ? "at" : "frame", e[0] == '@' ? e + 1 : e, g_nframes, g_px, g_max);
++        }
++    }
++    return g_on;
++}
++// Is the frame being recorded one to dump (the time trigger picks its frame once)
++static int want(void) {
++    if (!vka_rtd_on() || atomic_load(&g_written) >= g_max) return 0;
++    uint64_t f = vka_frame();
++    if (g_frame0 < 0) {
++        if (!g_t0) g_t0 = mono_ns();
++        if ((double)(mono_ns() - g_t0) / 1e9 < g_at) return 0;
++        g_frame0 = (long long)f; VLOG("DM_VK_RTDUMP: %.1f s reached at frame %llu", g_at, (unsigned long long)f);
++    }
++    if (f < (uint64_t)g_frame0 || f >= (uint64_t)g_frame0 + (uint64_t)g_nframes) return 0;
++    if (f != g_cur_frame) { g_cur_frame = f; g_pass = 0; VLOG("DM_VK_RTDUMP: dumping frame %llu", (unsigned long long)f); }
++    return 1;
++}
++void vka_rtd_draw(uint64_t fs) {   // a draw of the open pass (its fragment shader key, 0 = none)
++    if (!g_on) return;
++    g_ndraws++;
++    for (uint32_t i = 0; i < g_nfs; i++) if (g_fs[i] == fs) return;
++    if (g_nfs < 3) g_fs[g_nfs++] = fs;
++}
++
++// ---------- One readback ----------
++typedef struct job {
++    struct job *next;
++    VkBuffer buf; VkDeviceMemory bm; void *p;          // host-visible readback
++    VkImage tmp; VkDeviceMemory tm;                    // the scaled RGBA16F copy of a colour target (none for depth)
++    uint32_t w, h, sw, sh, depth_bytes; VkFormat vf; int depth;
++    uint64_t frame, serial, key; uint32_t pass, seq, ndraws; char kind; uint32_t nvfmt;
++} job;
++static job *g_jobs;   // this submission's, written once its fence is done
++
++static int hbuf(VkDeviceSize n, VkBuffer *b, VkDeviceMemory *m, void **p) {
++    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++    if (vk.vkCreateBuffer(V.dev, &bi, NULL, b)) return 0;
++    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, *b, &mr);
++    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
++    if (t == UINT32_MAX) t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
++    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
++    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, m)) { vk.vkDestroyBuffer(V.dev, *b, NULL); *b = VK_NULL_HANDLE; return 0; }
++    if (vk.vkBindBufferMemory(V.dev, *b, *m, 0) || vk.vkMapMemory(V.dev, *m, 0, VK_WHOLE_SIZE, 0, p)) {
++        vk.vkDestroyBuffer(V.dev, *b, NULL); vk.vkFreeMemory(V.dev, *m, NULL); *b = VK_NULL_HANDLE; *m = VK_NULL_HANDLE; return 0; }
++    return 1;
++}
++static void job_free(job *j) {
++    if (j->buf) vk.vkDestroyBuffer(V.dev, j->buf, NULL);
++    if (j->bm) vk.vkFreeMemory(V.dev, j->bm, NULL);
++    if (j->tmp) vk.vkDestroyImage(V.dev, j->tmp, NULL);
++    if (j->tm) vk.vkFreeMemory(V.dev, j->tm, NULL);
++    free(j);
++}
++static int can_blit(VkFormat f) {   // linear blits from this format (cached for 16 formats)
++    static VkFormat seen[16]; static int ok[16], n;
++    for (int i = 0; i < n; i++) if (seen[i] == f) return ok[i];
++    VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, f, &fp);
++    int r = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
++    if (n < 16) { seen[n] = f; ok[n++] = r; }
++    return r;
++}
++static void host_barrier(VkCommandBuffer cb) {
++    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
++    vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++}
++// Level lv, layer l0 of im (kept in VK_IMAGE_LAYOUT_GENERAL, as the replay keeps its images) into a new job
++static void dump_one(VkCommandBuffer cb, vka_img *im, uint32_t lv, uint32_t l0, char kind, uint64_t key) {
++    if (!im || !im->img || im->samples > 1 || im->depth > 1 || lv >= im->levels || l0 >= im->layers) return;
++    if (atomic_load(&g_seq) >= g_max) return;
++    if (!(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) { static int n; if (n++ < 4) VLOG("rtdump: serial %llu has no transfer source use: skipped", (unsigned long long)im->serial); return; }
++    uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1;
++    job *j = calloc(1, sizeof *j); if (!j) return;
++    j->w = w; j->h = h; j->frame = vka_frame(); j->serial = im->serial; j->key = key; j->pass = g_pass; j->kind = kind; j->nvfmt = (uint32_t)im->d.format; j->vf = im->f.vk; j->ndraws = g_ndraws;
++    if (im->f.kind == 3 || im->f.kind == 5) {   // depth: the whole level as it is (D16: 2 bytes, the others' depth aspect: 4)
++        j->depth = 1; j->depth_bytes = im->f.vk == VK_FORMAT_D16_UNORM ? 2 : 4;
++        VkDeviceSize n = (VkDeviceSize)w * h * j->depth_bytes;
++        if (n > 64ull << 20 || !hbuf(n, &j->buf, &j->bm, &j->p)) { free(j); return; }
++        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, lv, l0, 1}, {0, 0, 0}, {w, h, 1}};
++        vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, j->buf, 1, &c);
++    } else if (im->f.kind == 0 && im->f.bw <= 1 && im->f.bh <= 1 && can_blit(im->f.vk)) {   // colour: scaled into RGBA16F on the GPU
++        float s = (float)g_px / (float)(w > h ? w : h); if (s > 1) s = 1;
++        j->sw = (uint32_t)(w * s); j->sh = (uint32_t)(h * s); if (!j->sw) j->sw = 1; if (!j->sh) j->sh = 1;
++        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {j->sw, j->sh, 1}, .mipLevels = 1,
++            .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
++        if (vk.vkCreateImage(V.dev, &ci, NULL, &j->tmp)) { j->tmp = VK_NULL_HANDLE; job_free(j); return; }
++        VkMemoryRequirements mr; vk.vkGetImageMemoryRequirements(V.dev, j->tmp, &mr);
++        uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0); if (t == UINT32_MAX) t = vka_mem_type(mr.memoryTypeBits, 0, 0);
++        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
++        if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &j->tm) || vk.vkBindImageMemory(V.dev, j->tmp, j->tm, 0)) { job_free(j); return; }
++        if (!hbuf((VkDeviceSize)j->sw * j->sh * 8, &j->buf, &j->bm, &j->p)) { job_free(j); return; }
++        vka_img_barrier(cb, j->tmp, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)j->sw, (int32_t)j->sh, 1}}};
++        vk.vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, j->tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
++        vka_barrier(cb);
++        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {j->sw, j->sh, 1}};
++        vk.vkCmdCopyImageToBuffer(cb, j->tmp, VK_IMAGE_LAYOUT_GENERAL, j->buf, 1, &c);
++    } else {
++        static int n; if (n++ < 8) VLOG("rtdump: serial %llu VkFormat %d (kind %d) is not dumped (integer, compressed or not blittable)", (unsigned long long)im->serial, im->f.vk, im->f.kind);
++        free(j); return;
++    }
++    j->seq = (uint32_t)atomic_fetch_add(&g_seq, 1);
++    j->next = g_jobs; g_jobs = j;
++}
++
++// ---------- After the GPU: statistics and PNG ----------
++static float half_f(uint16_t h) {
++    uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023, u;
++    if (!e) { if (!m) u = s; else { e = 113; while (!(m & 1024)) { m <<= 1; e--; } m &= 1023; u = s | (e << 23) | (m << 13); } }
++    else if (e == 31) u = s | 0x7f800000u | (m << 13);
++    else u = s | ((e + 112) << 23) | (m << 13);
++    float f; memcpy(&f, &u, 4); return f;
++}
++static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++static int png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
++    uint8_t h[8]; put32(h, n); memcpy(h + 4, type, 4);
++    uLong c = crc32(0, (const Bytef *)type, 4); if (n) c = crc32(c, d, n);
++    uint8_t t[4]; put32(t, (uint32_t)c);
++    return fwrite(h, 1, 8, f) == 8 && (!n || fwrite(d, 1, n, f) == n) && fwrite(t, 1, 4, f) == 4;
++}
++static int png_write(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
++    size_t raw = (size_t)(w * 3 + 1) * h; uint8_t *r = malloc(raw); if (!r) return 0;
++    for (uint32_t y = 0; y < h; y++) { r[y * (w * 3 + 1)] = 0; memcpy(r + y * (w * 3 + 1) + 1, rgb + (size_t)y * w * 3, (size_t)w * 3); }
++    uLongf zn = compressBound((uLong)raw); uint8_t *z = malloc(zn);
++    if (!z || compress2(z, &zn, r, (uLong)raw, 6) != Z_OK) { free(r); free(z); return 0; }
++    FILE *f = fopen(path, "wb"); int ok = 0;
++    if (f) {
++        uint8_t ih[13]; put32(ih, w); put32(ih + 4, h); ih[8] = 8; ih[9] = 2; ih[10] = ih[11] = ih[12] = 0;
++        ok = fwrite("\x89PNG\r\n\x1a\n", 1, 8, f) == 8 && png_chunk(f, "IHDR", ih, 13) && png_chunk(f, "IDAT", z, (uint32_t)zn) && png_chunk(f, "IEND", NULL, 0);
++        ok = fclose(f) == 0 && ok;
++    }
++    free(r); free(z); return ok;
++}
++static void mkdirs(const char *p) {
++    char b[512]; snprintf(b, sizeof b, "%s", p);
++    for (char *s = b + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(b, 0775); *s = '/'; }
++    mkdir(b, 0775);
++}
++static void write_job(const job *j) {
++    const char *tmp = getenv("DM_TEMP"); if (!tmp) tmp = "/data/local/tmp";
++    char dir[512], path[640];
++    snprintf(dir, sizeof dir, "%s/rtdump/f%llu", tmp, (unsigned long long)j->frame); mkdirs(dir);
++    snprintf(path, sizeof path, "%s/%04u_%c%03u_s%llu_%d_%ux%u_%016llx.png", dir, j->seq, j->kind, j->pass, (unsigned long long)j->serial, (int)j->vf, j->w, j->h, (unsigned long long)j->key);
++    uint32_t ow = j->depth ? j->w : j->sw, oh = j->depth ? j->h : j->sh, step = 1;
++    if (j->depth) { uint32_t m = ow > oh ? ow : oh; while (m / step > (uint32_t)g_px) step++; }
++    uint32_t pw = (ow + step - 1) / step, ph = (oh + step - 1) / step;
++    uint8_t *rgb = malloc((size_t)pw * ph * 3); if (!rgb) return;
++    if (j->depth) {
++        float lo = INFINITY, hi = -INFINITY;
++        for (uint32_t y = 0; y < oh; y += step) for (uint32_t x = 0; x < ow; x += step) {
++            float v = j->depth_bytes == 2 ? ((const uint16_t *)j->p)[(size_t)y * ow + x] / 65535.0f : ((const float *)j->p)[(size_t)y * ow + x];
++            if (j->vf != VK_FORMAT_D16_UNORM && j->vf != VK_FORMAT_D32_SFLOAT && j->vf != VK_FORMAT_D32_SFLOAT_S8_UINT) v = (float)(((const uint32_t *)j->p)[(size_t)y * ow + x] & 0xffffff) / 16777215.0f;   // D24: the low 24 bits
++            if (v < lo) lo = v; if (v > hi) hi = v;
++        }
++        float sc = hi > lo ? 255.0f / (hi - lo) : 0;
++        for (uint32_t y = 0, py = 0; y < oh; y += step, py++) for (uint32_t x = 0, px = 0; x < ow; x += step, px++) {
++            float v = j->depth_bytes == 2 ? ((const uint16_t *)j->p)[(size_t)y * ow + x] / 65535.0f : ((const float *)j->p)[(size_t)y * ow + x];
++            if (j->vf != VK_FORMAT_D16_UNORM && j->vf != VK_FORMAT_D32_SFLOAT && j->vf != VK_FORMAT_D32_SFLOAT_S8_UINT) v = (float)(((const uint32_t *)j->p)[(size_t)y * ow + x] & 0xffffff) / 16777215.0f;
++            uint8_t g = (uint8_t)fminf(255.0f, fmaxf(0.0f, (v - lo) * sc)); uint8_t *o = rgb + ((size_t)py * pw + px) * 3; o[0] = o[1] = o[2] = g;
++        }
++        LOG("[vk] rtdump %04u %c%u frame %llu serial %llu depth VkFormat %d %ux%u: range %.6f .. %.6f (%u draws; first fragment %016llx)", j->seq, j->kind, j->pass, (unsigned long long)j->frame,
++            (unsigned long long)j->serial, (int)j->vf, j->w, j->h, lo, hi, j->ndraws, (unsigned long long)j->key);
++    } else {
++        const uint16_t *hp = j->p; size_t n = (size_t)ow * oh; double sum[4] = {0}, lum = 0; float mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
++        uint32_t nan = 0, inf = 0, black = 0; float *f = malloc(n * 4 * sizeof *f); if (!f) { free(rgb); return; }
++        for (size_t i = 0; i < n; i++) {
++            int bad = 0;
++            for (int c = 0; c < 4; c++) { float v = half_f(hp[i * 4 + c]); f[i * 4 + c] = v;
++                if (isnan(v)) { nan++; bad = 1; continue; } if (isinf(v)) { inf++; bad = 1; continue; }
++                if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; sum[c] += v; }
++            if (!bad) { double l = 0.2126 * f[i * 4] + 0.7152 * f[i * 4 + 1] + 0.0722 * f[i * 4 + 2]; lum += l; if (l <= 0) black++; }
++        }
++        double ml = lum / (double)n, ex = ml > 1e-12 ? 0.18 / ml : 1.0;
++        for (uint32_t y = 0; y < ph; y++) for (uint32_t x = 0; x < pw; x++) {
++            const float *v = f + ((size_t)y * ow + x) * 4; uint8_t *o = rgb + ((size_t)y * pw + x) * 3;
++            for (int c = 0; c < 3; c++) { float t = v[c]; if (!(t == t) || isinf(t)) { o[0] = 255; o[1] = 0; o[2] = 255; break; }   // NaN / Inf: magenta
++                t = (float)(t * ex); t = t > 0 ? t / (1 + t) : 0; o[c] = (uint8_t)fminf(255.0f, powf(t, 1 / 2.2f) * 255.0f + 0.5f); }
++        }
++        LOG("[vk] rtdump %04u %c%u frame %llu serial %llu VkFormat %d %ux%u: min %g %g %g %g max %g %g %g %g mean %g %g %g %g, mean luminance %g, %u NaN %u Inf, %.1f%% black (%u draws; first fragment %016llx)",
++            j->seq, j->kind, j->pass, (unsigned long long)j->frame, (unsigned long long)j->serial, (int)j->vf, j->w, j->h, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
++            sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n, ml, nan, inf, 100.0 * black / n, j->ndraws, (unsigned long long)j->key);
++        free(f);
++    }
++    if (!png_write(path, rgb, pw, ph)) { static int e; if (e++ < 4) LOG("[vk] [RED] rtdump: %s not written (errno %d)", path, errno); }
++    free(rgb);
++}
++static void written(void *arg) {
++    for (job *j = arg, *nx; j; j = nx) {
++        nx = j->next;
++        if (atomic_fetch_add(&g_written, 1) < g_max) write_job(j);
++        job_free(j);
++    }
++}
++
++// ---------- Hooks ----------
++// After a render pass ended (its writes made visible by the caller's barrier): its colour attachments and depth attachment
++void vka_rtd_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, const uint32_t *l0s, int n, vka_img *dim, uint32_t dlv, uint32_t dl0) {
++    if (!g_on) return;
++    uint64_t key = g_nfs ? g_fs[0] : 0; int w = want();
++    if (w) {
++        int any = 0; job *before = g_jobs;
++        for (int i = 0; i < n; i++) dump_one(cb, ims[i], lvs[i], l0s[i], 'p', key);
++        if (dim) dump_one(cb, dim, dlv, dl0, 'p', key);
++        any = g_jobs != before;
++        if (any) host_barrier(cb);
++        vka_barrier(cb);
++        g_pass++;
++    }
++    g_nfs = 0; g_ndraws = 0;
++}
++// After a compute dispatch (its writes made visible): the float storage images it bound, level 0, layer 0
++void vka_rtd_dispatch(VkCommandBuffer cb, uint64_t key, vka_img *const *ims, int n) {
++    if (!g_on || !want()) return;
++    job *before = g_jobs; uint32_t nd = g_ndraws; g_ndraws = 1;
++    for (int i = 0; i < n; i++) { int dup = 0; for (int k = 0; k < i; k++) dup |= ims[k] == ims[i]; if (!dup) dump_one(cb, ims[i], 0, 0, 'd', key); }
++    if (g_jobs != before) { host_barrier(cb); vka_barrier(cb); }
++    g_ndraws = nd; g_pass++;
++}
++void vka_rtd_commit(uint64_t fence) {   // this submission's readbacks are written once fence is done
++    if (!g_on || !g_jobs) return;
++    vka_after(fence, written, g_jobs); g_jobs = NULL;
++}
++#endif

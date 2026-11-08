@@ -39,3 +39,15 @@ Validation:
 - The focused depth and shader tests run in the workflow.
 - The APK signature, package ID and app label are checked after compiling.
 - Device installation and gameplay remain unverified here.
+
+# Render-target capture (rtdump.patch, diagnostic)
+
+Adds `DM_VK_RTDUMP` to the Vulkan replay (`dm/gfx/vk_android/vka_rtdump.c`): in one chosen frame, after every
+render pass and compute dispatch, each colour and depth target is read back and written as a small PNG preview to
+`Android/data/<package>/files/temp/0400486024DEC000/rtdump/f<frame>/`, with its raw value range logged
+(`rtdump` lines). It changes nothing unless the variable is set. Purpose: find the pass where Ocarina's shadows
+turn black and Link's lighting goes wrong. Version 0.2.4-rtdump1, versionCode 5, same package and key as the
+previous Banana OOT Fix build, so it installs as an update over it.
+
+Use (Extra environment): `DM_VK_RTDUMP=@40` (the first frame 40 s after the game starts drawing),
+optional `DM_VK_RTDUMP_FRAMES=2`, `DM_VK_RTDUMP_PX=512`, `DM_VK_RTDUMP_MAX=400`.

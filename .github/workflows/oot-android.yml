@@ -56,6 +56,8 @@ jobs:
           cd upstream
           git apply --check ../patches/oot-mesh-depth.patch
           git apply ../patches/oot-mesh-depth.patch
+          git apply --check ../patches/rtdump.patch
+          git apply ../patches/rtdump.patch
           DM_GAME=0400486024DEC000 python3 -m unittest dm.tools.tests.test_vka_mesh_depth dm.tools.tests.test_vka_spec_freeze dm.tools.tests.test_vk_android_abi
       - name: Match official play behavior with a separate package
         shell: bash
@@ -103,7 +105,7 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1-side -PnxVersionCode=4 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump1 -PnxVersionCode=5 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
@@ -123,7 +125,7 @@ jobs:
           tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
           cp README.md deliverables/
           cp patches/README.md deliverables/CANDIDATE-NOTES.md
-          cp patches/oot-mesh-depth.patch deliverables/
+          cp patches/oot-mesh-depth.patch patches/rtdump.patch deliverables/
       - uses: actions/upload-artifact@v4
         if: success()
         with:
