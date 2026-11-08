@@ -1,0 +1,125 @@
+--- a/dm/gfx/vk_android/vka_draw.c
++++ b/dm/gfx/vk_android/vka_draw.c
+@@ -1635,8 +1635,8 @@
+ // drawn as spikes on Qualcomm's driver"): on Qualcomm's driver the depth-only prepass mesh draws of Ocarina of Time's foliage draw some primitives from vertex slots never
+ // written (white spikes converging on the screen centre), while the colour pass's own mesh modules draw the same instances right; believed to be the driver's compiler on
+ // the prepass modules, not proven. So a depth-only draw (depth test and write on, no colour channel written) of a listed prepass mesh shader is skipped (-1), and a draw of
+-// its colour pass's mesh shader tests LEQUAL where the game asked for EQUAL (1): the colour pass then draws against the depth without the foliage. Cost: the foliage writes
+-// no depth (its colour pass writes none), so later passes that read the depth (fog, shadows) may differ where it is. On Qualcomm's driver (driverID) by default;
++// its colour pass's mesh shader tests LEQUAL and writes depth where the game asked for read-only EQUAL (1). The colour pass supplies the skipped surface depth;
++// effects that consume depth before that colour pass still cannot see it. The driver's prepass fault remains open. On Qualcomm's driver (driverID) by default;
+ // DM_VK_MESH_PREPASS_SKIP=0 off, =1 on every driver
+ static int mesh_cut(const vka_dstate *d, const p_set_rt *rt, int has_rt, uint64_t key) {
+     static const uint64_t cut[][2] = DM_GAME_MESH_PREPASS_CUT;
+@@ -1651,6 +1651,15 @@
+         return -1;
+     }
+     return 0;
++}
++// The paired colour draw replaces a skipped depth prepass. Testing LEQUAL alone
++// leaves the surface absent from depth for subsequent effects. Only convert the
++// read-only EQUAL draw: other passes using the same shader keep their state.
++static void mesh_cut_depth(int paired, int test, uint32_t *write, uint32_t *func) {
++    if (paired && test && !*write && *func == NVN_DEPTH_FUNC_EQUAL) {
++        *write = 1;
++        *func = NVN_DEPTH_FUNC_LEQUAL;
++    }
+ }
+ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
+     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
+@@ -1665,7 +1674,7 @@
+     // An NVN2 mesh draw (nvnCommandBufferDrawMeshTasks, hle_nvn.c): the task (optional) and mesh shaders of one program, the fragment stage's shader, in a mesh pipeline
+     // (vka_pso.c pstate_fill) drawn with vkCmdDrawMeshTasksEXT: no vertex input, primitive type or index buffer
+     const int mesh = dw && dw->prim == NVN_PRIM_MESH;
+-    int eq_relax = 0;   // mesh_cut: EQUAL drawn as LEQUAL
++    int eq_relax = 0;   // mesh_cut: read-only EQUAL replaced by LEQUAL with depth writes
+     if (mesh) {
+         if (!V.mesh) SKIP("mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
+         // The program whose task and mesh shaders run: the fragment stage's when it has a mesh shader (a program's stages are bound together), else the one bound at the
+@@ -1903,8 +1912,9 @@
+     else DY_SET1(topo, (uint32_t)(topo), vk.vkCmdSetPrimitiveTopology(g_cb, DY.topo));
+     int hd = R.df != VK_FORMAT_UNDEFINED, hs = R.sf != VK_FORMAT_UNDEFINED;
+     DY_SET1(dt, (uint32_t)(hd && d->ds.dt), vk.vkCmdSetDepthTestEnable(g_cb, DY.dt));
+-    DY_SET1(dw, (uint32_t)(hd && d->ds.dt && d->ds.dw), vk.vkCmdSetDepthWriteEnable(g_cb, DY.dw));
+-    uint32_t dfv = eq_relax && d->ds.df == NVN_DEPTH_FUNC_EQUAL ? NVN_DEPTH_FUNC_LEQUAL : d->ds.df;   // mesh_cut
++    uint32_t dwv = d->ds.dw, dfv = d->ds.df;
++    mesh_cut_depth(eq_relax, d->ds.dt, &dwv, &dfv);
++    DY_SET1(dw, (uint32_t)(hd && d->ds.dt && dwv), vk.vkCmdSetDepthWriteEnable(g_cb, DY.dw));
+     DY_SET1(dc, (uint32_t)(dfv >= 1 && dfv <= 8 ? (VkCompareOp)(dfv - 1) : VK_COMPARE_OP_ALWAYS), vk.vkCmdSetDepthCompareOp(g_cb, DY.dc));
+     DY_SET1(dbt, (uint32_t)(VK_FALSE), vk.vkCmdSetDepthBoundsTestEnable(g_cb, DY.dbt));
+     DY_SET1(stt, (uint32_t)(hs && d->ds.st), vk.vkCmdSetStencilTestEnable(g_cb, DY.stt));
+--- /dev/null
++++ b/dm/tools/tests/test_vka_mesh_depth.py
+@@ -0,0 +1,50 @@
++"""Exercise the production fallback's depth state with the host C compiler.
++
++The colour pass must supply the depth omitted by mesh_cut, without changing
++unpaired draws or other depth modes that happen to use a paired shader.
++"""
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[3]
++
++
++class MeshDepth(unittest.TestCase):
++    def test_depth_replacement_and_other_passes(self):
++        cc = shutil.which('cc')
++        if not cc:
++            self.skipTest('no C compiler')
++        source = (ROOT / 'dm/gfx/vk_android/vka_draw.c').read_text()
++        function = re.search(r'static void mesh_cut_depth\([^\n]+\) \{.*?\n\}', source, re.S)
++        self.assertIsNotNone(function)
++        harness = '''
++#include <stdint.h>
++#include <assert.h>
++enum { NVN_DEPTH_FUNC_EQUAL = 3, NVN_DEPTH_FUNC_LEQUAL = 4 };
++'''+function.group()+'''
++int main(void) {
++    for (int pair = 0; pair < 2; ++pair)
++    for (int test = 0; test < 2; ++test)
++    for (uint32_t write = 0; write < 2; ++write)
++    for (uint32_t func = 1; func <= 8; ++func) {
++        uint32_t w = write, f = func;
++        mesh_cut_depth(pair, test, &w, &f);
++        if (pair && test && !write && func == NVN_DEPTH_FUNC_EQUAL) {
++            assert(w == 1 && f == NVN_DEPTH_FUNC_LEQUAL);
++        } else { assert(w == write && f == func); }
++    }
++}
++'''
++        with tempfile.TemporaryDirectory() as d:
++            p = Path(d)
++            (p / 'test.c').write_text(harness)
++            subprocess.run([cc, '-std=c11', '-Wall', '-Wextra', '-Werror', str(p / 'test.c'), '-o', str(p / 'test')], check=True)
++            subprocess.run([str(p / 'test')], check=True)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/dm/games/0400486024DEC000/README.md
++++ b/dm/games/0400486024DEC000/README.md
+@@ -74,7 +74,7 @@
+ 
+ ## Open
+ 
+-- Open (2026-11-08), current: the foliage's depth-only prepass on Qualcomm's driver (Adreno 840) draws white zig-zag spikes converging on the centre of the screen. A workaround ships, not a fix: the profile's ten `mesh_prepass_cut` pairs skip the prepass mesh draws (`0c1ffecd02018fb0` and nine others, depth write, LESS, colour mask 0) and relax their colour pass (`eed1add7c89f5d34` and nine others, EQUAL, no depth write) to LEQUAL; pairs matched by the indirect record they draw. The user saw the correct picture with it on the system driver. Cost: the foliage writes no depth, so the fog, shadows and ambient occlusion where it stands may differ slightly. Ruled out by experiment: the instance records and bindings (the colour pass alone is right), barriers, the lane source, depth clamp, the colour mask. The prepass modules themselves are the lead (Qualcomm's compiler, not proven); next: bisect pair `0c1ffecd02018fb0` / `7ad8843afe105a32` by module mutation ([rendering.md](../../../docs/reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver)). On Turnip (no `VK_EXT_mesh_shader`) no foliage. Once fixed, drop the key.
++- Open (2026-11-08), current: the foliage's depth-only prepass on Qualcomm's driver (Adreno 840) draws white zig-zag spikes converging on the centre of the screen. A workaround ships, not a fix: the profile's ten `mesh_prepass_cut` pairs skip the prepass mesh draws (`0c1ffecd02018fb0` and nine others, depth write, LESS, colour mask 0) and relax their colour pass (`eed1add7c89f5d34` and nine others, EQUAL, no depth write) to LEQUAL; pairs matched by the indirect record they draw. The user saw the correct picture with it on the system driver. Candidate (not checked on a phone): the paired read-only EQUAL colour draws now use LEQUAL with depth writes, restoring foliage depth after that draw. Depth consumers before the colour pass still cannot see the skipped prepass, and the driver prepass fault remains open. This does not establish the cause of every black patch or lighting glitch. Ruled out by experiment: the instance records and bindings (the colour pass alone is right), barriers, the lane source, depth clamp, the colour mask. The prepass modules themselves are the lead (Qualcomm's compiler, not proven); next: bisect pair `0c1ffecd02018fb0` / `7ad8843afe105a32` by module mutation ([rendering.md](../../../docs/reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver)). On Turnip (no `VK_EXT_mesh_shader`) no foliage. Once fixed, drop the key.
+ 
+ - Resolved (2026-11-07): the Kokiri Forest false colours; see Found on this game (R32_UINT shader-image views without storage use). Its investigation: view reinterpretation and float images bound to integer textures were ruled out; the NDSR network sampled serial 107213 (RGB9E5) that still held R11G11B10 bits, because a335's `r32ui` writes were dropped.
+ - No HUD on the phone in the run with library `v-39c415842121`: no hearts, minimap or text 4 and 18 s after frame 4,500, and the HUD pair mesh `147550d4e76629d5` with pixel `442da04b508b2667` was never asked for. With the older library the hearts and minimap drew, and that pair failed pipeline creation with -13 (the pixel module lacked `PerPrimitiveEXT`; a freshly built pixel module with any mesh shader compiles in the probe). Whether the HUD was simply not on screen yet is open: one run only.
+--- a/docs/reference/rendering.md
++++ b/docs/reference/rendering.md
+@@ -737,7 +737,7 @@
+ 
+ - **Symptom:** (Android, Qualcomm's driver, Adreno 840) once indirect mesh draws draw, foliage shows as glowing white zig-zag spikes that converge on the centre of the screen, and the frame around them is over-exposed.
+ - **Cause:** open. The game draws its foliage twice: a depth-only prepass (colour write mask 0, depth write, LESS) and a colour pass of the same instances that tests EQUAL against it. The colour pass alone, with the prepass skipped and EQUAL relaxed to LEQUAL, draws the foliage right, so the instance records and every binding are right. The prepass mesh draws alone draw the spikes: some primitives reference vertex slots that were never written (an unwritten slot is clip (0, 0, 0, 1), the centre of the screen). Ruled out by experiment: barriers, uniform and storage buffers, the lane source (`SubgroupLocalInvocationId` vs `LocalInvocationIndex`), depth clamp, and the colour mask (the prepass with mask 0xf draws the same spikes). The prepass and colour pass use different mesh modules; the likely cause is Qualcomm's compiler on the prepass modules; not proven.
+-- **Workaround (stopgap, not a fix):** the profile key `mesh_prepass_skip` lists the prepass mesh shaders. On Qualcomm's driver their draws are skipped when they are depth-only (depth write on, no colour channel written), and draws of the paired colour pass mesh shaders that test EQUAL test LEQUAL instead (`vka_draw.c` `mesh_cut`). On Turnip (no `VK_EXT_mesh_shader`) no mesh draw draws, so no foliage either way. Cost: the objects write no depth (the colour pass has depth write off), so later passes that read the scene depth (fog, shadows, ambient occlusion) may differ slightly where they are. `DM_VK_MESH_PREPASS_SKIP=0` turns it off, `=1` applies it on every driver.
++- **Workaround (stopgap, not a fix):** the profile key `mesh_prepass_skip` lists the prepass mesh shaders. On Qualcomm's driver their draws are skipped when they are depth-only (depth write on, no colour channel written), and draws of the paired colour pass mesh shaders that test EQUAL test LEQUAL instead (`vka_draw.c` `mesh_cut`). On Turnip (no `VK_EXT_mesh_shader`) no mesh draw draws, so no foliage either way. Candidate correction (not checked on a phone): paired depth-tested, read-only EQUAL colour draws now enable depth writes with LEQUAL, so depth consumers after the colour pass can see the surface. Other comparisons, depth-writing draws and disabled depth tests retain their original state. Consumers before that colour pass still see the skipped prepass; the driver fault remains open. The production state conversion is covered across 64 combinations in `test_vka_mesh_depth.py`. `DM_VK_MESH_PREPASS_SKIP=0` turns it off, `=1` applies it on every driver.
+ - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#open).
+ - **Next:** bisect one prepass pair (mesh `0c1ffecd02018fb0` / pixel `7ad8843afe105a32`) by module mutation: the pixel input's `NoPerspective`, the mesh module's output count, its barriers, the module as the driver gets it (spirv-val).
+ 

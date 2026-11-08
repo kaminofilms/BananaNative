@@ -1,8 +1,8 @@
-name: Banana official-behavior baseline APK
+name: OOT foliage depth candidate
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/oot-android.yml']
+    paths: ['.github/workflows/oot-android.yml', 'patches/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -28,6 +28,7 @@ jobs:
           curl --fail --location --retry 3 --max-time 180 -o upstream.zip https://git.eden-emu.dev/moceure/BananaNative/archive/v0.2.4.zip
           curl --fail --location --retry 3 --max-time 180 -o official.apk https://git.eden-emu.dev/moceure/BananaNative/releases/download/v0.2.4/banana-native-v0.2.4.apk
           echo "972ad854455727531ef70440179954e26054ee253555b6c05dfd7c3c7b9f38b5  official.apk" | sha256sum --check
+          echo "644494f4ea60553bd561869937ca0f758058bb91b8a19f7ddd276414ccd779fc  upstream.zip" | sha256sum --check
           sha256sum upstream.zip official.apk > input-sha256.txt
           python3 - <<'PY'
           from pathlib import Path
@@ -48,6 +49,14 @@ jobs:
                   py.extractall(stage/'python')
           assert (stage/'python/lib/python3.14/os.py').is_file()
           PY
+      - name: Apply foliage depth correction and check depth states
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream
+          git apply --check ../patches/oot-mesh-depth.patch
+          git apply ../patches/oot-mesh-depth.patch
+          DM_GAME=0400486024DEC000 python3 -m unittest dm.tools.tests.test_vka_mesh_depth dm.tools.tests.test_vka_spec_freeze dm.tools.tests.test_vk_android_abi
       - name: Match official play behavior with a separate package
         shell: bash
         run: |
@@ -69,9 +78,9 @@ jobs:
         with:
           path: ~/.android/debug.keystore
           key: banana-oot-signing-v1
-      - name: Build official-behavior baseline APK
+      - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1 -PnxVersionCode=2 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
@@ -81,10 +90,12 @@ jobs:
           find upstream/android/app/out -maxdepth 1 -name '*.apk' -exec cp {} deliverables/ \; 2>/dev/null || true
           tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
           cp README.md deliverables/
+          cp patches/README.md deliverables/CANDIDATE-NOTES.md
+          cp patches/oot-mesh-depth.patch deliverables/
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: banana-oot-baseline
+          name: banana-oot-depth-candidate
           path: deliverables/
           retention-days: 14
           if-no-files-found: error
