@@ -25,9 +25,11 @@ and this custom application's pipeline cache can be reused. An official app's
 private cache is separate. No save migration or deletion is performed.
 
 Package: dev.nxnative.android.ootdebug, same as the previous custom baseline.
-Uses the existing Actions signing cache. It cannot update the official release;
+Uses an explicit custom keystore path cached by Actions (banana-oot-signing-v2).
+The old cache did not save a key, so this candidate's certificate is different
+from earlier custom builds; an in-place update over those builds is not promised. It cannot update the official release;
 an update over a custom build also requires matching signing certificates.
-Keep existing app data and saves. Version: 0.2.4-depth1, versionCode 2.
+Keep existing app data and saves. Version: 0.2.4-depth1, versionCode 3.
 
 Validation:
 - The production depth-state helper is compiled and exercised over 64 combinations

@@ -76,18 +76,39 @@ jobs:
           chmod +x upstream/android/app/gradlew
       - uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: banana-oot-signing-v1
+          path: ${{ runner.temp }}/banana-signing
+          key: banana-oot-signing-v2
+      - name: Keep the custom signing key at the cached path
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/banana-signing"
+          key="$RUNNER_TEMP/banana-signing/oot-debug.keystore"
+          if [ ! -f "$key" ]; then
+            keytool -genkeypair -keystore "$key" -storepass android -keypass android -alias AndroidDebugKey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
+          fi
+          echo "NX_DEBUG_KEYSTORE=$key" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/android/app/build.gradle')
+          s = p.read_text()
+          old = '    signingConfigs {'
+          assert s.count(old) == 1
+          s = s.replace(old, old + "\n        debug { storeFile file(System.getenv('NX_DEBUG_KEYSTORE')) }")
+          p.write_text(s)
+          PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1 -PnxVersionCode=2 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-depth1 -PnxVersionCode=3 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
         run: |
           mkdir -p deliverables
           cp input-sha256.txt deliverables/ 2>/dev/null || true
-          find upstream/android/app/out -maxdepth 1 -name '*.apk' -exec cp {} deliverables/ \; 2>/dev/null || true
+          test -f upstream/android/app/out/nxnative-android-play.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs upstream/android/app/out/nxnative-android-play.apk > deliverables/apk-signature.txt
+          cp upstream/android/app/out/nxnative-android-play.apk deliverables/
           tar --exclude=upstream/android/app/.gradle --exclude=upstream/android/app/build --exclude=upstream/android/app/.cxx --exclude=upstream/android/app/out --exclude=upstream/android/app/local.properties -czf deliverables/build-source.tar.gz upstream
           cp README.md deliverables/
           cp patches/README.md deliverables/CANDIDATE-NOTES.md
