@@ -162,7 +162,17 @@
  void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines) {
 --- a/dm/gfx/vk_android/vka_exec.c
 +++ b/dm/gfx/vk_android/vka_exec.c
-@@ -425,6 +425,7 @@
+@@ -159,7 +159,8 @@
+         if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)(uintptr_t)ops[i].addr; if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v; }
+         else {
+             // A timestamp report's counter: the time, or 0 under render_cond (as on the GPU, nvn_mtl.m rc_value). Samples passed: 1, so occlusion culling keeps everything visible until draws count
+-            uint64_t t = ops[i].type, rec[2] = {t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? (DM_GAME_RENDER_COND ? 0 : ticks) : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0, ticks};
++            int dm_occ_samples(void);   // (hle_nvn.c: DM_VK_OCC_SAMPLES, 1)
++            uint64_t t = ops[i].type, rec[2] = {t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? (DM_GAME_RENDER_COND ? 0 : ticks) : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (uint64_t)dm_occ_samples() : 0, ticks};
+             memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
+         }
+     }
+@@ -425,6 +426,7 @@
      g_hrec[fence % NHREC].sub_ns = now_ns();
      g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
      if (vka_nan_on()) vka_nan_commit(fence);
@@ -1243,7 +1253,15 @@
 +}
 --- a/docs/env_switches.tsv
 +++ b/docs/env_switches.tsv
-@@ -404,6 +404,7 @@
+@@ -190,6 +190,7 @@
+ DM_NVN_PROF	diagnostic	`=1` wraps the implemented NVN functions in a timing wrapper and collects the time each takes during recording
+ DM_NVN_PROGTRACE	diagnostic	`=<vertex keys,...>` logs matching ProgramSetShaders calls and their guest backtraces
+ DM_NVN_REGLUM	diagnostic	`=x0,y0,x1,y1:<file>` (normalized coordinates): on every present records the present number, time, mean luminance and a grayscale thumbnail of that region, to check animation speed against frame rate
++DM_NVN_REPORT_EARLY	switch	`0` (read once, on) a samples-passed report's count is written only when its submission completes; on, also when the game records it (`hle_nvn.c`; Lichii: Ocarina of Time read stale occlusion counts and the scene flashed overexposed when the camera moved)
+ DM_NVN_RT_RANGE	switch	`=1` (experimental, off by default; with `DM_NVN_TBDR=1`) keeps the pass open when the game sets the same colour and depth target again with a view that differs only in its level count
+ DM_NVN_RT_RANGE_CHECK	diagnostic	With `DM_NVN_RT_RANGE=1` and `DM_NVN_PASSDUMP`, renders a candidate pass both ways in the same frame and logs and writes the comparison (`CHECK_RESULTS.tsv`, `[RED]` on a difference)
+ DM_NVN_SHDUMP	diagnostic	`=<dir>` saves programs missing from the shader map as `<key>.ctl` (control section) and `<key>.code`, to find the files that hold them
+@@ -404,6 +405,7 @@
  DM_VK_ENC_TAIL	switch	`=<bytes>` (Android, live: the next submission, 16384; at most 1 MB) the command encoder thread tells the replay thread how far it has got (its tail: a store, a full fence and a load) every that many bytes of calls, when it has caught up and while the replay thread sleeps on it; `0` after every call, as before
  DM_VK_FG	switch	not read as a switch: a prefix in the Vulkan replayer's list of the live run's settings it does not take from a capture (`vka_replay.c`), which covers `DM_VK_FG_REFRESH_CAP`
  DM_VK_FG_REFRESH_CAP	switch	(Android, live, 1) frame generation makes no more images per game frame than the panel's refreshes in the game's period (display timing): on a 60 Hz panel a 60 fps game gets none instead of being held at 30 fps by FIFO; `0` generates the multiplier's count whatever the panel runs at (a driver whose display timing reports a refresh the panel does not run at)
@@ -1251,7 +1269,7 @@
  DM_VK_FOUT_COMPS	switch	`0` (Android, live: pixel shaders made from then on, 1) pixel shaders' colour outputs write every component of their targets, as before, instead of only the components the module stores (the others keep the target's value, as Maxwell leaves them)
  DM_VK_FOUT_RETYPE	switch	`=0` (Android): a pixel shader's float output into a UINT / SINT attachment is not retyped (`vka_spv_fout_retype`); that target is not written, the earlier behaviour; default on
  DM_VK_FRAME_RATE	switch	`0` (Android, live, 1) the window is not given the game's frame rate (`ANativeWindow_setFrameRate`, held by `DM_VK_FRAME_RATE_HOLD`); the panel's rate is left to the system
-@@ -452,6 +453,7 @@
+@@ -452,6 +454,7 @@
  DM_VK_MESH_IND	switch	`0` (Android, live, on) draws an indirect mesh draw from its NVN2 record itself (x = count, y = first workgroup: nothing drawn) instead of a {count, 1, 1} copy made on the GPU before the pass ([rendering.md](reference/rendering.md#indirect-mesh-draws-drew-nothing))
  DM_VK_MESH_LOG	diagnostic	`1` (Android) logs each task / mesh / pixel shader triple of a mesh draw once, with its first draw's workgroup count and whether the mesh shader has per-primitive outputs
  DM_VK_MESH_PREPASS_SKIP	switch	`0` / `1` (Android, live; unset: on with Qualcomm's driver) the profile's `mesh_prepass_cut` workaround: `0` draws the listed depth-only mesh prepass draws and keeps their colour pass's EQUAL, `1` skips and relaxes them on every driver ([rendering.md](reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver))
@@ -1259,14 +1277,17 @@
  DM_VK_MESH_SKIP	diagnostic	`=<mesh key>,...` (Android) skips the mesh draws of those mesh shaders, to find a wrong mesh draw by taking draws away in a replay
  DM_VK_NANSCAN	diagnostic	`1` / `2` (Android, restart, needs push descriptors) after every render pass scans the float colour attachments (and the float storage images each dispatch wrote) for NaN / infinite texels and logs the passes with any (frame, attachment, shaders); `2` also splits passes to find the draw (`DM_VK_NANSCAN_STEP`, `_DRAWS`, `_SERIAL`); not for play
  DM_VK_NANSCAN_BIG	diagnostic	`=<value>` (Android, restart) with `DM_VK_NANSCAN`, finite texels with a channel above that value (absolute) count as infinite: to find the pass or draw that first writes out-of-range values (fireflies that bloom spreads)
-@@ -462,6 +464,7 @@
+@@ -462,8 +465,10 @@
  DM_VK_NANSCAN_LINES	diagnostic	`=<n>` (Android, restart) with `DM_VK_NANSCAN`, the most result lines logged in a run (default 200)
  DM_VK_NANSCAN_SERIAL	diagnostic	`=<serial>` (Android, restart) with `DM_VK_NANSCAN=2`, split only passes into the image of that texture serial (default any)
  DM_VK_NANSCAN_STEP	diagnostic	`=<n>` (Android, restart, default 64) with `DM_VK_NANSCAN=2`, the pass is ended and scanned after every n draws
 +DM_VK_NAN_GUARD	switch	`0` (Android, read once, on) pixel shaders' float colour outputs are not guarded; on, each store into one is `isnan(v) ? 0 : clamp(v, -1e30, 1e30)` (`vka_spvguard.c`, Hookshot's GuardFragmentOutputs: one NaN pixel went through the bloom into a white flash); a module whose float outputs feed integer targets is left
  DM_VK_NDSR	player	`=<n>` (Android, live, default 2) what runs in place of a game's neural upscaler (NDSR, Donkey Kong Bananza): `0` the game's own network, `1` a smooth stretch, `2` FSR 1, `3` nearest neighbor; the launcher sets it from the Upscaler setting
  DM_VK_NDSR_SHARP	player	`=<stops>` (Android, live, default 0.25) how much FSR sharpens after scaling up in place of the neural upscaler: `0` the most, each stop halves it, below 0 no sharpening
++DM_VK_OCC_SAMPLES	switch	`=<n>` (read once, 1) the count a samples-passed report reads (the replay counts no samples): Hookshot answers 4096, everything visible (Ocarina of Time's sun visibility follows it)
  DM_VK_OVERLAY	switch	`0` (Android, live, 1) the launcher's overlay (build tag, frame rate and its items) is shown by Android views over the game instead of being drawn by the present into the game's images (`vka_present.c` `ovl_draw`; the views made the app's window draw and the compositor blend a second changing layer, issue #34)
+ DM_VK_PACE_LOG	diagnostic	`=<ms>` (Android, live, 5000) a `[vk] pace` line every that many ms: intervals, fps, GPU busy and span p50/p90, the replay's recording and its CPU time, draws, GPU clock floor, ADPF mode, window rate and panel refresh, thermal status and headroom, CPU clocks; `0` off; and a `[vk] pace cost` line: the recording split into draws, texture prepare, submission start, commit and other records, the replay and encoder threads' time on a core, waiting for one and their switches, the encoder's time by kind of call, the draw path by phase (`DM_VK_PACE_PROF`)
+ DM_VK_PACE_PROF	diagnostic	`=<n>` (Android, live: the next submission, 16) with `DM_VK_PACE_LOG`, one draw in n is timed by phase for the `[vk] pace cost` line (ten counter reads in such a draw); `0` none (the line then has no draw path part); `DM_VK_PROF=1` times every draw
 --- a/dm/host/crash.c
 +++ b/dm/host/crash.c
 @@ -3,6 +3,8 @@
@@ -1302,3 +1323,21 @@
      for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, (unsigned long long)PLAT_UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
      fprintf(stderr, "\n");
      // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1117,8 +1117,15 @@
+ NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
+     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
+ }
++// A samples-passed report's count is also in memory from the moment it is recorded, not only once its submission completes (vka_exec.c post_run): the game can read it
++// before then and read the count of an earlier frame or the 0 it reset there. Lichii found Ocarina of Time reading such stale occlusion counts (976 in 2.5 minutes): the
++// scene flashed overexposed for a few frames whenever the camera moved (zortos293/Lichii 7ae3e74). The replay writes the same constant count, DM_VK_OCC_SAMPLES (1).
++// DM_NVN_REPORT_EARLY=0 (read once): only at completion
++int dm_occ_samples(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_OCC_SAMPLES"); v = e ? atoi(e) : 1; if (v < 0) v = 1; } return v; }
+ NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
+     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
++    static int early = -1; if (early < 0) { const char *e = getenv("DM_NVN_REPORT_EARLY"); early = !e || atoi(e) != 0; }
++    if (early && t == NVN_COUNTER_TYPE_SAMPLES_PASSED && a && !(a & 7)) { uint64_t v = (uint64_t)dm_occ_samples(); memcpy((void *)(uintptr_t)a, &v, 8); }
+ }
+ NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
+     (void)flags;
