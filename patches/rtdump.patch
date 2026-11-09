@@ -172,7 +172,7 @@
              memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
          }
      }
-@@ -423,8 +424,14 @@
+@@ -423,8 +424,15 @@
      vka_up_flush(); vka_up_throttle();   // before the submission that may use what it made
      if (!r) r = vka_submit(g_cb, fence, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
      g_hrec[fence % NHREC].sub_ns = now_ns();
@@ -180,7 +180,8 @@
 +    // submission (with DM_VK_WORKER=0 the game waits too). Ocarina of Time double-buffers its light data (the lighting pass 3687985571c47db6's bindings alternate
 +    // between two addresses a frame) and Link flashes white for single frames: if this ends it, the GPU read a buffer the game was already rewriting (Hookshot's reason
 +    // to capture memory at each submission). Slow
-+    { static int sw = -1; if (sw < 0) sw = VKA_ENV("DM_VK_SUBMIT_WAIT", 0); if (sw && !r) vka_wait_done(fence, 2000000000ull); }
++    { static int sw = -1; if (sw < 0) sw = VKA_ENV("DM_VK_SUBMIT_WAIT", 0);
++      if (sw && !r) { uint64_t q = vka_fence_queued(); if (q) vka_wait_done(q, 500000000ull); } }   // the last fence on the queue (this one may be handed over later)
      g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
      if (vka_nan_on()) vka_nan_commit(fence);
 +    if (vka_rtd_on()) vka_rtd_commit(fence);
