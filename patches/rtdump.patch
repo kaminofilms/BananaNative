@@ -172,8 +172,15 @@
              memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
          }
      }
-@@ -425,6 +426,7 @@
+@@ -423,8 +424,14 @@
+     vka_up_flush(); vka_up_throttle();   // before the submission that may use what it made
+     if (!r) r = vka_submit(g_cb, fence, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
      g_hrec[fence % NHREC].sub_ns = now_ns();
++    // DM_VK_SUBMIT_WAIT=1 (diagnostic, read once): each submission is waited for before the replay goes on, so the GPU never reads memory the game wrote after the
++    // submission (with DM_VK_WORKER=0 the game waits too). Ocarina of Time double-buffers its light data (the lighting pass 3687985571c47db6's bindings alternate
++    // between two addresses a frame) and Link flashes white for single frames: if this ends it, the GPU read a buffer the game was already rewriting (Hookshot's reason
++    // to capture memory at each submission). Slow
++    { static int sw = -1; if (sw < 0) sw = VKA_ENV("DM_VK_SUBMIT_WAIT", 0); if (sw && !r) vka_wait_done(fence, 2000000000ull); }
      g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
      if (vka_nan_on()) vka_nan_commit(fence);
 +    if (vka_rtd_on()) vka_rtd_commit(fence);
@@ -1288,6 +1295,14 @@
  DM_VK_OVERLAY	switch	`0` (Android, live, 1) the launcher's overlay (build tag, frame rate and its items) is shown by Android views over the game instead of being drawn by the present into the game's images (`vka_present.c` `ovl_draw`; the views made the app's window draw and the compositor blend a second changing layer, issue #34)
  DM_VK_PACE_LOG	diagnostic	`=<ms>` (Android, live, 5000) a `[vk] pace` line every that many ms: intervals, fps, GPU busy and span p50/p90, the replay's recording and its CPU time, draws, GPU clock floor, ADPF mode, window rate and panel refresh, thermal status and headroom, CPU clocks; `0` off; and a `[vk] pace cost` line: the recording split into draws, texture prepare, submission start, commit and other records, the replay and encoder threads' time on a core, waiting for one and their switches, the encoder's time by kind of call, the draw path by phase (`DM_VK_PACE_PROF`)
  DM_VK_PACE_PROF	diagnostic	`=<n>` (Android, live: the next submission, 16) with `DM_VK_PACE_LOG`, one draw in n is timed by phase for the `[vk] pace cost` line (ten counter reads in such a draw); `0` none (the line then has no draw path part); `DM_VK_PROF=1` times every draw
+@@ -526,6 +531,7 @@
+ DM_VK_STRETCH	player	`1` (Android, live, off) the game's picture is stretched over the whole window instead of fitted with its aspect ratio kept (`vka_present_fit.h`); Game settings › Display › Stretch to screen and the in-game panel's Picture › Fit / Stretch set it, per game; the panel's change reaches the running game through `DM_CTL` and the launcher maps touches to the same rectangle
+ DM_VK_SUBGROUP_GS	switch	`0` / `1` (Android, restart) `0`: the geometry stage runs one-lane subgroups; `1`: as the device reports; default 0 on Turnip (which computes subgroup operations wrong there), 1 on other drivers
+ DM_VK_SUBGROUP_PIN	switch	`=<stage mask>` (Android, restart, default 1 = every stage that can) the stages (`VkShaderStageFlags`) whose subgroup size is pinned to the shader library's; `0` none
++DM_VK_SUBMIT_WAIT	diagnostic	`1` (Android, read once, off) each submission is waited for before the replay goes on (with `DM_VK_WORKER=0` the game waits too): the GPU never reads memory the game wrote after the submission; slow (`vka_exec.c`; Ocarina of Time's double-buffered light data)
+ DM_VK_SWAP_RB	diagnostic	`=<n>` the present's red/blue swap (`vka_present.c vka_swap_rb`; default the profile's `DM_GAME_SWAP_RB`, else 0)
+ DM_VK_SYNCLOG	diagnostic	`=<n>` (Android, live, 0 = off) logs the game's next n waits together with each submission's recording and queueing times and timestamp reports (`sync …` lines, one clock in ms)
+ DM_VK_TEST_HANG	diagnostic	`=<mode>[,<ticket>]` (Android, restart; ticket default 600) at that present the copy waits for a timeline value no earlier batch signals: mode 1 the next fence, mode 2 a value nothing signals (a sure stall, to test the hang handling)
 --- a/dm/host/crash.c
 +++ b/dm/host/crash.c
 @@ -3,6 +3,8 @@
