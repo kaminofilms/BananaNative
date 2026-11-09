@@ -149,6 +149,45 @@
      VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
      VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
      free(w);
+--- a/dm/gfx/vk_android/vka_shlib.c
++++ b/dm/gfx/vk_android/vka_shlib.c
+@@ -1,6 +1,8 @@
+ // The Vulkan shader library reader (vka_shlib.h). Every offset in the file is checked once at open, so lookups afterwards index the tables without further checks
+ #include "vka_shlib.h"
+ #include "vka_abi_compat.h"
++#include "vka_spvpatch.h"
++#include <stdatomic.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -129,6 +131,17 @@
+         if (ZSTD_isError(r) || r != m->size) { fail(err, errn, "zstd: %s (%zu of %u bytes)", ZSTD_isError(r) ? ZSTD_getErrorName(r) : "short frame", ZSTD_isError(r) ? 0 : r, m->size); free(w); return NULL; }
+     }
+     if (w[0] != 0x07230203u) { fail(err, errn, "not SPIR-V (first word %#x)", w[0]); free(w); return NULL; }
+-    if (nbytes) *nbytes = m->size;
++    size_t nb = m->size;
++    // DM_VK_FIN_SPLIT=0 (read once): a pixel shader's indexed input array is left as the translator wrote it. On (the default) it is split into one input per
++    // location (vka_spvsplit.c): Adreno reads such an array against the vertex stage's separate outputs as zeros (Ocarina's probe prefilter, black shadows)
++    static int split = -1; if (split < 0) { const char *e = getenv("DM_VK_FIN_SPLIT"); split = !e || atoi(e) != 0; }
++    if (split) {
++        char why[160]; size_t on = 0; uint32_t *o = vka_spv_fin_split(w, nb / 4, &on, why, sizeof why);
++        if (o) {
++            static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 12) fprintf(stderr, "[dm] [vk] pixel shader inputs: %s (%zu -> %zu bytes; DM_VK_FIN_SPLIT=0 leaves them)\n", why, nb, on * 4);
++            free(w); w = o; nb = on * 4;
++        } else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] pixel shader inputs not split: %s (the module as it is)\n", why); }
++    }
++    if (nbytes) *nbytes = nb;
+     return w;
+ }
+--- a/dm/gfx/vk_android/vka_spvpatch.h
++++ b/dm/gfx/vk_android/vka_spvpatch.h
+@@ -29,3 +29,6 @@
+ uint32_t *vka_spv_gs_link(const uint32_t *gw, size_t gn, const uint32_t *vw, size_t vn, const uint32_t *fw, size_t fn, uint32_t *copied, uint32_t *nulled, size_t *out_nw, char *err, size_t errn);
+ // A pixel shader's colour outputs: the components each location's stores can write (bit c of comp[loc]), for the colour write mask: 0, or -1 when the module is not read
+ int vka_spv_fout_comps(const uint32_t *w, size_t nw, uint8_t comp[8]);
++// vka_spvsplit.c: a pixel shader's indexed Input array of vec4 split into one Input per location, the array made Private and filled at the entry (Adreno reads
++// such an array against a vertex stage's separate outputs as zeros). NULL with err "none" when the module has no such array
++uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn);
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_rtdump.c
 @@ -0,0 +1,273 @@
@@ -425,3 +464,219 @@
 +    vka_after(fence, written, g_jobs); g_jobs = NULL;
 +}
 +#endif
+--- /dev/null
++++ b/dm/gfx/vk_android/vka_spvsplit.c
+@@ -0,0 +1,213 @@
++// vka_spv_fin_split: a stage's indexed interface array split into one variable per location (plain C, no Vulkan).
++//
++// The translator declares the user attributes a shader reads or writes through an indirect attribute access (Maxwell ALD / AST / IPA with a register index) as one
++// array of vec4 (`in vec4 a[16]` or `out vec4 a[16]` at Location 0) and indexes it with the register (Ryujinx's IaIndexing / OaIndexing,
++// ShaderDefinitions.GetUserDefinedType); a stage without that indexing declares one vec4 per location. Vulkan matches an interface by location and type, so an
++// array on one side against separate vec4s on the other is a mismatch the spec leaves undefined. Qualcomm's Adreno driver (Adreno 840, 2026-11-09) reads such a
++// pixel shader input array as zeros: Ocarina of Time's probe prefilter (agl's 62b2ec7b555ad8a8, after the vertex shader aba07143e1696f1b's six separate outputs)
++// read a zero direction, rejected every sample and wrote black into every level of the environment cube, so nothing in shadow had ambient light (black shadows,
++// Link lit only by his highlights). The other shader of the same pass (de4e1bfab0572149), which reads separate inputs, drew.
++//
++// So every such array becomes one variable per location, on both sides, and every interface is per-location whatever each stage declared:
++//   pixel shaders (Fragment): an Input array of N vec4 at Location L becomes N Input vec4s (Location L+i, the array's interpolation decorations); the array is a
++//     Private variable, filled from them at the start of the entry point;
++//   vertex, tessellation evaluation and geometry shaders: an Output array becomes N Output vec4s; the array is Private, and its elements are copied to them before
++//     each OpReturn of the entry point (and, in a geometry shader, before each OpEmitVertex / OpEmitStreamVertex).
++// N is 1..32, the element is vec4 of 32-bit floats, and no other variable of the entry point's interface on that side uses locations L..L+N-1. The body's access
++// chains into the array are retyped to Private pointers; nothing else changes. Mesh and tessellation control shaders (per-vertex outer arrays) are left as they
++// are. No change: NULL with err "none" (the caller keeps the module).
++#include "vka_spvpatch.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++enum { S_OpLine = 8, S_OpEntryPoint = 15, S_OpTypeInt = 21, S_OpTypeFloat = 22, S_OpTypeVector = 23, S_OpTypeArray = 28, S_OpTypePointer = 32, S_OpConstant = 43,
++       S_OpFunction = 54, S_OpFunctionEnd = 56, S_OpVariable = 59, S_OpLoad = 61, S_OpStore = 62, S_OpAccessChain = 65, S_OpInBoundsAccessChain = 66,
++       S_OpDecorate = 71, S_OpEmitVertex = 218, S_OpEmitStreamVertex = 220, S_OpLabel = 248, S_OpReturn = 253, S_OpReturnValue = 254, S_OpNoLine = 317 };
++enum { S_DecLocation = 30, S_DecComponent = 31, S_SCInput = 1, S_SCOutput = 3, S_SCPrivate = 6 };
++enum { S_ExecVertex = 0, S_ExecTessEval = 2, S_ExecGeometry = 3, S_ExecFragment = 4 };
++
++typedef struct { uint32_t *w; size_t n, cap; } sv_t;
++static int sput(sv_t *v, uint32_t x) {
++    if (v->n == v->cap) { size_t c = v->cap ? 2 * v->cap : 4096; uint32_t *p = realloc(v->w, c * 4); if (!p) return 0; v->w = p; v->cap = c; }
++    v->w[v->n++] = x; return 1;
++}
++static int sput_n(sv_t *v, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) if (!sput(v, x[i])) return 0; return 1; }
++#define OPW(op, len) ((uint32_t)(len) << 16 | (uint32_t)(op))
++
++typedef struct { uint32_t id, sc, pointee; } sptr;
++typedef struct { uint32_t var, arr, n, loc, base, pptr; uint32_t decs[8][3]; int ndec; } starget;   // base: the first of its n new variable ids
++
++uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn) {
++#define SFAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
++    uint32_t *loc = NULL, *arr_elem = NULL, *arr_len = NULL, *cval = NULL, *isvar = NULL, *derived = NULL, *ctype = NULL;
++    sptr *ptrs = NULL; size_t nptr = 0, cptr = 0;
++    sv_t o = {0};
++    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
++    uint32_t bound = w[3], version = w[1];
++    loc = calloc(bound, 4); arr_elem = calloc(bound, 4); arr_len = calloc(bound, 4); cval = calloc(bound, 4); isvar = calloc(bound, 4); derived = calloc(bound, 4); ctype = calloc(bound, 4);
++    if (!loc || !arr_elem || !arr_len || !cval || !isvar || !derived || !ctype) SFAIL("out of memory");
++    for (uint32_t i = 0; i < bound; i++) loc[i] = ~0u;
++    // The first entry point decides the side: a pixel shader's inputs, a vertex / tessellation evaluation / geometry shader's outputs
++    uint32_t model = ~0u, entry_fn = 0; size_t ep_at = 0, first_fn = nw;
++    for (size_t i = 5; i < nw;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) SFAIL("bad instruction at word %zu", i);
++        if (op == S_OpEntryPoint && len >= 3) { model = w[i + 1]; entry_fn = w[i + 2]; ep_at = i; break; } i += len; }
++    if (model != S_ExecFragment && model != S_ExecVertex && model != S_ExecTessEval && model != S_ExecGeometry) { snprintf(err, errn, "none"); goto fail; }
++    int outside = model != S_ExecFragment;   // outputs, copied out
++    uint32_t sc_io = outside ? S_SCOutput : S_SCInput;
++    // Pass 1: types, constants, pointers, locations, the interface variables of that side
++    uint32_t t_f32 = 0, t_v4f = 0, t_int = 0;
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
++        if (!len || i + len > nw) SFAIL("bad instruction at word %zu", i);
++        const uint32_t *a = w + i + 1;
++        if (op == S_OpDecorate && len >= 4 && a[1] == S_DecLocation && a[0] < bound) loc[a[0]] = a[2];
++        else if (op == S_OpTypeFloat && len >= 3 && a[1] == 32) t_f32 = a[0];
++        else if (op == S_OpTypeInt && len >= 4 && a[1] == 32) { if (!t_int || !a[2]) t_int = a[0]; }   // a uint32 if there is one
++        else if (op == S_OpTypeVector && len >= 4 && a[1] == t_f32 && t_f32 && a[2] == 4) t_v4f = a[0];
++        else if (op == S_OpTypeArray && len >= 4 && a[0] < bound) { arr_elem[a[0]] = a[1]; arr_len[a[0]] = a[2]; }
++        else if (op == S_OpConstant && len >= 4 && a[1] < bound) { cval[a[1]] = a[2]; ctype[a[1]] = a[0]; }
++        else if (op == S_OpTypePointer && len >= 4) {
++            if (nptr == cptr) { cptr = cptr ? 2 * cptr : 256; sptr *p = realloc(ptrs, cptr * sizeof *p); if (!p) SFAIL("out of memory"); ptrs = p; }
++            ptrs[nptr++] = (sptr){a[0], a[1], a[2]};
++        }
++        else if (op == S_OpVariable && len >= 4 && a[2] == sc_io && a[1] < bound) isvar[a[1]] = a[0];   // the variable's pointer type
++        else if (op == S_OpFunction && first_fn == nw) first_fn = i;
++        i += len;
++    }
++    if (!t_f32 || !t_v4f || !t_int || first_fn == nw) { snprintf(err, errn, "none"); goto fail; }
++    // The entry point's interface
++    uint32_t ep_len = w[ep_at] >> 16; size_t nm = 3;   // words after the opcode word: model, function, then the name's words
++    while (nm < ep_len) { uint32_t x = w[ep_at + nm]; nm++; if (!(x & 0xff000000u) || !(x & 0xff0000u) || !(x & 0xff00u) || !(x & 0xffu)) break; }
++    const uint32_t *iface = w + ep_at + nm; size_t niface = ep_len - nm;
++    // The arrays to split
++    starget tg[8]; int ntg = 0;
++    for (size_t k = 0; k < niface && ntg < 8; k++) {
++        uint32_t v = iface[k]; if (v >= bound || !isvar[v] || loc[v] == ~0u) continue;
++        uint32_t pt = isvar[v], pointee = 0;
++        for (size_t p = 0; p < nptr; p++) if (ptrs[p].id == pt) { pointee = ptrs[p].pointee; break; }
++        if (!pointee || pointee >= bound || arr_elem[pointee] != t_v4f || !arr_len[pointee] || arr_len[pointee] >= bound) continue;
++        uint32_t n = cval[arr_len[pointee]]; if (n < 1 || n > 32) continue;
++        int clash = 0;
++        for (size_t q = 0; q < niface; q++) { uint32_t u = iface[q]; if (u == v || u >= bound || !isvar[u] || loc[u] == ~0u) continue; if (loc[u] >= loc[v] && loc[u] < loc[v] + n) clash = 1; }
++        if (clash) continue;
++        tg[ntg] = (starget){v, pointee, n, loc[v], 0, 0, {{0}}, 0}; ntg++;
++    }
++    if (!ntg) { snprintf(err, errn, "none"); goto fail; }
++    // The interpolation decorations of each array (Flat, NoPerspective, Centroid, Sample: copied to each of its variables)
++    for (size_t i = 5; i < first_fn;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (op == S_OpDecorate && len >= 3 && len <= 4) for (int t = 0; t < ntg; t++) if (a[0] == tg[t].var && a[1] != S_DecLocation && a[1] != S_DecComponent && tg[t].ndec < 8) {
++            tg[t].decs[tg[t].ndec][0] = a[1]; tg[t].decs[tg[t].ndec][1] = len == 4 ? a[2] : 0; tg[t].decs[tg[t].ndec][2] = len; tg[t].ndec++; }
++        i += len;
++    }
++    // New ids: pointer types the module lacks, index constants, the variables
++    uint32_t nb = bound;
++    uint32_t newptr[64][3]; int nnew = 0;   // id, sc, pointee
++    #define FINDPTR(SC, PT, OUT) do { OUT = 0; for (size_t p_ = 0; p_ < nptr; p_++) if (ptrs[p_].sc == (SC) && ptrs[p_].pointee == (PT)) { OUT = ptrs[p_].id; break; } \
++        for (int q_ = 0; !OUT && q_ < nnew; q_++) if (newptr[q_][1] == (SC) && newptr[q_][2] == (PT)) OUT = newptr[q_][0]; \
++        if (!OUT) { if (nnew >= 64) SFAIL("too many pointer types"); OUT = nb++; newptr[nnew][0] = OUT; newptr[nnew][1] = (SC); newptr[nnew][2] = (PT); nnew++; } } while (0)
++    uint32_t p_io_v4, p_priv_v4; FINDPTR(sc_io, t_v4f, p_io_v4); FINDPTR(S_SCPrivate, t_v4f, p_priv_v4);
++    for (int t = 0; t < ntg; t++) { FINDPTR(S_SCPrivate, tg[t].arr, tg[t].pptr); tg[t].base = nb; nb += tg[t].n; }
++    uint32_t cidx[32] = {0}, newc[32]; int nnewc = 0; uint32_t maxn = 0, tot = 0; for (int t = 0; t < ntg; t++) { if (tg[t].n > maxn) maxn = tg[t].n; tot += tg[t].n; }
++    for (uint32_t k = 0; k < maxn; k++) {
++        for (uint32_t c = 1; c < bound && !cidx[k]; c++) if (ctype[c] == t_int && cval[c] == k) cidx[k] = c;
++        if (!cidx[k]) { cidx[k] = nb++; newc[nnewc++] = k; }
++    }
++    // Access chains into the arrays: their pointer result types to Private ones; and the copy sites (outputs: each return of the entry point, a geometry shader's emits)
++    uint32_t chain_map[64][2]; int nmap = 0; uint32_t sites = 0;
++    for (int t = 0; t < ntg; t++) derived[tg[t].var] = 1;
++    { int in_e = 0;
++      for (size_t i = first_fn; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (op == S_OpFunction && len >= 5) in_e = a[1] == entry_fn;
++        if ((op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[2] < bound && derived[a[2]]) {
++            derived[a[1]] = 1;
++            int have = 0; for (int m = 0; m < nmap; m++) if (chain_map[m][0] == a[0]) have = 1;
++            if (!have) {
++                uint32_t pointee = 0; for (size_t p = 0; p < nptr; p++) if (ptrs[p].id == a[0]) { pointee = ptrs[p].pointee; break; }
++                if (!pointee) SFAIL("an access chain's pointer type %u is not declared", a[0]);
++                uint32_t np; FINDPTR(S_SCPrivate, pointee, np);
++                if (nmap >= 64) SFAIL("too many access chain types");
++                chain_map[nmap][0] = a[0]; chain_map[nmap][1] = np; nmap++;
++            }
++        }
++        if (outside && in_e && (op == S_OpReturn || op == S_OpReturnValue)) sites++;
++        if (outside && model == S_ExecGeometry && (op == S_OpEmitVertex || op == S_OpEmitStreamVertex)) sites++;
++        i += len;
++      }
++    }
++    if (outside && !sites) SFAIL("no return in the entry point");
++    if (!outside) sites = 1;
++    uint32_t copy_ids = nb; nb += 2 * tot * sites;   // per copied element and site: a load and an access chain
++    // Pass 2: the module written again
++    if (!sput_n(&o, w, 5)) SFAIL("out of memory");
++    o.w[3] = nb;
++    int in_entry = 0, copied = 0, past_label = 0; uint32_t id = copy_ids;
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        int skip = 0;
++        if (i == ep_at) {
++            int keep_private = version >= 0x10400;   // SPIR-V 1.4 lists every global the entry point uses, Private ones too
++            size_t at = o.n; if (!sput(&o, 0)) SFAIL("out of memory");
++            if (!sput_n(&o, w + i + 1, nm - 1)) SFAIL("out of memory");
++            for (size_t k = 0; k < niface; k++) { int is_t = 0; for (int t = 0; t < ntg; t++) if (iface[k] == tg[t].var) is_t = 1; if ((!is_t || keep_private) && !sput(&o, iface[k])) SFAIL("out of memory"); }
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (!sput(&o, tg[t].base + k)) SFAIL("out of memory");
++            o.w[at] = OPW(S_OpEntryPoint, o.n - at); skip = 1;
++        } else if (op == S_OpDecorate && len >= 3) {
++            for (int t = 0; t < ntg; t++) if (a[0] == tg[t].var) {
++                skip = 1;
++                if (a[1] == S_DecLocation)
++                    for (uint32_t k = 0; k < tg[t].n; k++) {
++                        uint32_t d[4] = {OPW(S_OpDecorate, 4), tg[t].base + k, S_DecLocation, tg[t].loc + k}; if (!sput_n(&o, d, 4)) SFAIL("out of memory");
++                        for (int e = 0; e < tg[t].ndec; e++) { uint32_t dd[4] = {OPW(S_OpDecorate, tg[t].decs[e][2]), tg[t].base + k, tg[t].decs[e][0], tg[t].decs[e][1]}; if (!sput_n(&o, dd, tg[t].decs[e][2])) SFAIL("out of memory"); }
++                    }
++            }
++        } else if (op == S_OpVariable && len >= 4) {
++            for (int t = 0; t < ntg; t++) if (a[1] == tg[t].var) { uint32_t v[4] = {OPW(S_OpVariable, 4), tg[t].pptr, tg[t].var, S_SCPrivate}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); skip = 1; }
++        } else if ((op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[2] < bound && derived[a[2]]) {
++            size_t at = o.n; if (!sput_n(&o, w + i, len)) SFAIL("out of memory");
++            for (int m = 0; m < nmap; m++) if (chain_map[m][0] == a[0]) o.w[at + 1] = chain_map[m][1];
++            skip = 1;
++        }
++        if (i == first_fn) {   // the new globals, before the first function
++            for (int q = 0; q < nnew; q++) { uint32_t p[4] = {OPW(S_OpTypePointer, 4), newptr[q][0], newptr[q][1], newptr[q][2]}; if (!sput_n(&o, p, 4)) SFAIL("out of memory"); }
++            for (int q = 0; q < nnewc; q++) { uint32_t c[4] = {OPW(S_OpConstant, 4), t_int, cidx[newc[q]], newc[q]}; if (!sput_n(&o, c, 4)) SFAIL("out of memory"); }
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) { uint32_t v[4] = {OPW(S_OpVariable, 4), p_io_v4, tg[t].base + k, sc_io}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
++        }
++        if (op == S_OpFunction && len >= 5) { in_entry = a[1] == entry_fn; past_label = 0; }
++        if (!outside && in_entry && !copied && past_label && op != S_OpVariable && op != S_OpLine && op != S_OpNoLine) {   // inputs: into the array, after the entry block's variables
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) {
++                uint32_t ld[4] = {OPW(S_OpLoad, 4), t_v4f, id, tg[t].base + k}, ac[5] = {OPW(S_OpAccessChain, 5), p_priv_v4, id + 1, tg[t].var, cidx[k]}, st[3] = {OPW(S_OpStore, 3), id + 1, id};
++                if (!sput_n(&o, ld, 4) || !sput_n(&o, ac, 5) || !sput_n(&o, st, 3)) SFAIL("out of memory");
++                id += 2;
++            }
++            copied = 1;
++        }
++        if (outside && ((in_entry && (op == S_OpReturn || op == S_OpReturnValue)) || (model == S_ExecGeometry && (op == S_OpEmitVertex || op == S_OpEmitStreamVertex)))) {   // outputs: out of the array
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) {
++                uint32_t ac[5] = {OPW(S_OpAccessChain, 5), p_priv_v4, id, tg[t].var, cidx[k]}, ld[4] = {OPW(S_OpLoad, 4), t_v4f, id + 1, id}, st[3] = {OPW(S_OpStore, 3), tg[t].base + k, id + 1};
++                if (!sput_n(&o, ac, 5) || !sput_n(&o, ld, 4) || !sput_n(&o, st, 3)) SFAIL("out of memory");
++                id += 2;
++            }
++            copied = 1;
++        }
++        if (in_entry && op == S_OpLabel) past_label = 1;
++        if (!skip && !sput_n(&o, w + i, len)) SFAIL("out of memory");
++        i += len;
++    }
++    if (!copied) SFAIL("the entry point's first block was not found");
++    if (id > nb) SFAIL("id bound overrun (%u > %u)", id, nb);
++    o.w[3] = id > copy_ids ? id : nb;   // the ids used (the copy ids were reserved for every site)
++    if (o.w[3] < copy_ids) o.w[3] = copy_ids;
++    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs);
++    *out_nw = o.n;
++    snprintf(err, errn, "%s: %d %s array(s) split into %u variables", model == S_ExecFragment ? "pixel" : model == S_ExecVertex ? "vertex" : model == S_ExecGeometry ? "geometry" : "tessellation evaluation",
++             ntg, outside ? "output" : "input", tot);
++    return o.w;
++fail:
++    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs); free(o.w);
++    return NULL;
++#undef SFAIL
++#undef FINDPTR
++}
