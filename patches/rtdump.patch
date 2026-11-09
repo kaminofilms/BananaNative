@@ -140,9 +140,9 @@
      int fits = V.props.limits.maxComputeSharedMemorySize >= DMSH_VK_SHARED_MAX;
      g_shuffle_lds = want && fits;
 +    // Task and mesh shaders' subgroup shuffles made of broadcasts and selects on Qualcomm's driver, as Eden does (vka_spvshuf.c; Ocarina of Time's foliage depth passes
-+    // drew spikes, into the shadow maps too). DM_VK_MESH_SHUFFLE_BCAST (restart): 0 = the instruction; default 1 on VK_DRIVER_ID_QUALCOMM_PROPRIETARY, 0 elsewhere
++    // drew spikes, into the shadow maps too). DM_VK_MESH_SHUFFLE_BCAST (restart): 1 = broadcasts, 0 = the instruction (default)
 +    {   uint32_t lanes = g_sg_one[DMSH_VK_STAGE_MS] ? 0 : g_sg_pin[DMSH_VK_STAGE_MS] ? g_sg_pin[DMSH_VK_STAGE_MS] : V.subgroup_size;
-+        int bc = VKA_ENV("DM_VK_MESH_SHUFFLE_BCAST", V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
++        int bc = VKA_ENV("DM_VK_MESH_SHUFFLE_BCAST", 0);   // (off by default: Ocarina's foliage mesh shaders have no shuffle, 2026-11-09)
 +        vka_spv_bcast_lanes = bc && V.mesh && lanes >= 2 && lanes <= 128 ? lanes : 0;
 +        if (V.mesh) VLOG("task and mesh subgroup shuffles: %s", vka_spv_bcast_lanes ? "broadcasts and selects over the subgroup (DM_VK_MESH_SHUFFLE_BCAST=0: the instruction)" : "the instruction (DM_VK_MESH_SHUFFLE_BCAST=1: broadcasts)"); }
      VLOG("compute subgroup shuffles: %s", g_shuffle_lds ? "through workgroup memory where the library has the module (DM_VK_SHUFFLE_LDS=0: the instruction)"
@@ -217,6 +217,16 @@
  // A geometry shader that writes memory, with those writes made by one run per primitive (vka_spv_gs_claim: the Adreno 840 runs a geometry shader several times for each
  // primitive, each run writing memory). out NULL: only counts them. Made from the base module after the one-invocation subgroup rewrite
  static int gs_words(vka_shader *s, uint32_t **out, size_t *on, char *err, size_t errn) {
+@@ -388,7 +444,9 @@
+     pthread_mutex_unlock(&g_mu);
+     VkShaderModule mod = VK_NULL_HANDLE; char err[256] = ""; int own = 0;
+     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_BASE);
++    vka_spv_guard_skip = 1;   // their bits are data: no NaN guard (vka_spvguard.c)
+     size_t nb = 0; uint32_t *w = m ? vka_shlib_spirv(s->lib, m, &nb, err, sizeof err) : NULL;
++    vka_spv_guard_skip = 0;
+     if (w && (s->e->flags & DMSH_VK_F_SUBGROUP)) single_lane(s->key, s->e->stage, &w, &nb);
+     size_t on = 0; uint32_t *o = w ? vka_spv_fout_retype(w, nb / 4, umask, smask, &on, err, sizeof err) : NULL;
+     if (o) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = on * 4, .pCode = o};
 --- a/dm/gfx/vk_android/vka_shlib.c
 +++ b/dm/gfx/vk_android/vka_shlib.c
 @@ -1,6 +1,8 @@
@@ -228,7 +238,7 @@
  #include <fcntl.h>
  #include <stdarg.h>
  #include <stdio.h>
-@@ -129,6 +131,28 @@
+@@ -129,6 +131,37 @@
          if (ZSTD_isError(r) || r != m->size) { fail(err, errn, "zstd: %s (%zu of %u bytes)", ZSTD_isError(r) ? ZSTD_getErrorName(r) : "short frame", ZSTD_isError(r) ? 0 : r, m->size); free(w); return NULL; }
      }
      if (w[0] != 0x07230203u) { fail(err, errn, "not SPIR-V (first word %#x)", w[0]); free(w); return NULL; }
@@ -243,6 +253,15 @@
 +            static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 12) fprintf(stderr, "[dm] [vk] shader outputs: %s (%zu -> %zu bytes; DM_VK_FIN_SPLIT=0 leaves them)\n", why, nb, on * 4);
 +            free(w); w = o; nb = on * 4;
 +        } else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] shader outputs not split: %s (the module as it is)\n", why); }
++    }
++    // Pixel shaders: no NaN or infinity into a float colour target (vka_spvguard.c; one NaN pixel went through the bloom into a white flash: Hookshot's fix).
++    // DM_VK_NAN_GUARD=0 (read once): the module as it is
++    static int guard = -1; if (guard < 0) { const char *e = getenv("DM_VK_NAN_GUARD"); guard = !e || atoi(e) != 0; }
++    if (guard) {
++        char why[160]; size_t on = 0; uint32_t *o = vka_spv_nan_guard(w, nb / 4, &on, why, sizeof why);
++        if (o) { static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 4) fprintf(stderr, "[dm] [vk] pixel shader: %s (%zu -> %zu bytes; DM_VK_NAN_GUARD=0 leaves them)\n", why, nb, on * 4);
++                 free(w); w = o; nb = on * 4; }
++        else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] pixel shader outputs not guarded: %s (the module as it is)\n", why); }
 +    }
 +    // Task and mesh modules: subgroup shuffles made of broadcasts on Qualcomm's driver (vka_spv_bcast_lanes, vka_spvshuf.c)
 +    if (vka_spv_bcast_lanes) {
@@ -260,7 +279,7 @@
  }
 --- a/dm/gfx/vk_android/vka_spvpatch.h
 +++ b/dm/gfx/vk_android/vka_spvpatch.h
-@@ -29,3 +29,12 @@
+@@ -29,3 +29,16 @@
  uint32_t *vka_spv_gs_link(const uint32_t *gw, size_t gn, const uint32_t *vw, size_t vn, const uint32_t *fw, size_t fn, uint32_t *copied, uint32_t *nulled, size_t *out_nw, char *err, size_t errn);
  // A pixel shader's colour outputs: the components each location's stores can write (bit c of comp[loc]), for the colour write mask: 0, or -1 when the module is not read
  int vka_spv_fout_comps(const uint32_t *w, size_t nw, uint8_t comp[8]);
@@ -272,7 +291,11 @@
 +// vka_spvshuf.c: every subgroup shuffle of a module made of broadcasts over `lanes` lanes and selects (Qualcomm's driver computes the shuffle wrong; Eden never emits it
 +// there). NULL with err "none" when the module has none. vka_spv_bcast_lanes: the lanes task and mesh modules get it with (0: off), set by vka_shader.c's shuffle_plan
 +uint32_t *vka_spv_shuffle_bcast(const uint32_t *w, size_t nw, uint32_t lanes, size_t *out_nw, char *err, size_t errn);
-+extern uint32_t vka_spv_bcast_lanes;   // the locations a pre-rasterization module writes, bit per location
++extern uint32_t vka_spv_bcast_lanes;
++// vka_spvguard.c: a pixel shader's stores into float colour outputs made NaN-free and clamped to +-1e30 (Hookshot's GuardFragmentOutputs). NULL with err "none"
++// when it has none; vka_spv_guard_skip (this thread): none made (a module whose float outputs feed integer targets)
++uint32_t *vka_spv_nan_guard(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn);
++extern _Thread_local int vka_spv_guard_skip;   // the locations a pre-rasterization module writes, bit per location
 --- a/dm/gfx/vk_android/vka_pso.c
 +++ b/dm/gfx/vk_android/vka_pso.c
 @@ -365,12 +365,20 @@
@@ -1014,6 +1037,133 @@
 +    return NULL;
 +#undef QFAIL
 +}
+--- /dev/null
++++ b/dm/gfx/vk_android/vka_spvguard.c
+@@ -0,0 +1,124 @@
++// vka_spv_nan_guard: no NaN or infinity into a pixel shader's float colour outputs (plain C, no Vulkan).
++//
++// One NaN pixel in a float scene target goes through the bloom's chain of averages into a white flash, and draws black itself. Hookshot (the native PC port of
++// Ocarina of Time for Switch 2, NotRexed/Hookshot, gpu/vk/eden/shader_recompiler/ir_opt/oot_visual_workaround.h GuardFragmentOutputs, GPL-3.0-or-later) caught
++// it there (a NaN in the scene target, the blur after it) and guards every float colour output: Ocarina's Link flashing white in single frames and black cores on
++// the phone (Adreno 840, Qualcomm's driver) are the same picture. Where the NaN comes from is not known (the console's blend may drop it).
++// Here, on the SPIR-V of a pixel shader: each store into a float (32-bit scalar or vector) Output variable with a Location, or a chain into one, stores
++//   isnan(v) ? 0 : clamp(v, -1e30, 1e30)
++// instead. A module whose float outputs are retyped for integer targets (vka_shader_fout_module) is made without it (their bits are data; vka_spv_guard_skip).
++// No change: NULL with err "none"
++#include "vka_spvpatch.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++_Thread_local int vka_spv_guard_skip;
++
++enum { G_OpExtInstImport = 11, G_OpMemoryModel = 14, G_OpEntryPoint = 15, G_OpTypeBool = 20, G_OpTypeFloat = 22, G_OpTypeVector = 23, G_OpTypePointer = 32,
++       G_OpConstant = 43, G_OpConstantComposite = 44, G_OpConstantNull = 46, G_OpFunction = 54, G_OpVariable = 59, G_OpStore = 62, G_OpAccessChain = 65,
++       G_OpInBoundsAccessChain = 66, G_OpDecorate = 71, G_OpExtInst = 12, G_OpIsNan = 156, G_OpSelect = 169 };
++enum { G_DecBuiltIn = 11, G_DecLocation = 30, G_SCOutput = 3, G_FClamp = 43, G_ExecFragment = 4 };
++
++typedef struct { uint32_t *w; size_t n, cap; } gv_t;
++static int gput(gv_t *v, uint32_t x) {
++    if (v->n == v->cap) { size_t c = v->cap ? 2 * v->cap : 8192; uint32_t *p = realloc(v->w, c * 4); if (!p) return 0; v->w = p; v->cap = c; }
++    v->w[v->n++] = x; return 1;
++}
++static int gput_n(gv_t *v, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) if (!gput(v, x[i])) return 0; return 1; }
++#define GW(op, len) ((uint32_t)(len) << 16 | (uint32_t)(op))
++
++uint32_t *vka_spv_nan_guard(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn) {
++#define GFAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
++    gv_t o = {0}; uint32_t *ptee = NULL, *outv = NULL, *flt = NULL, *loc = NULL, *bi = NULL;
++    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
++    if (vka_spv_guard_skip) { snprintf(err, errn, "none"); return NULL; }
++    uint32_t bound = w[3];
++    ptee = calloc(bound, 4); outv = calloc(bound, 4); flt = calloc(bound, 4); loc = calloc(bound, 4); bi = calloc(bound, 4);   // flt: components of an f32 scalar / vector type
++    if (!ptee || !outv || !flt || !loc || !bi) GFAIL("out of memory");
++    uint32_t t_f32 = 0, glsl = 0, model = ~0u; uint32_t t_bvec[5] = {0}; size_t first_fn = nw, at_mm = 0, nstore = 0;
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (!len || i + len > nw) GFAIL("bad instruction at word %zu", i);
++        if (op == G_OpExtInstImport && len >= 3 && !memcmp(a + 1, "GLSL.std.450", 12)) glsl = a[0];
++        else if (op == G_OpMemoryModel) at_mm = i;
++        else if (op == G_OpEntryPoint && model == ~0u && len >= 2) model = a[0];
++        else if (op == G_OpDecorate && len >= 4 && a[0] < bound && a[1] == G_DecLocation) loc[a[0]] = 1;
++        else if (op == G_OpDecorate && len >= 3 && a[0] < bound && a[1] == G_DecBuiltIn) bi[a[0]] = 1;
++        else if (op == G_OpTypeFloat && len >= 3 && a[1] == 32 && a[0] < bound) { flt[a[0]] = 1; t_f32 = a[0]; }
++        else if (op == G_OpTypeBool && len >= 2) t_bvec[1] = a[0];
++        else if (op == G_OpTypeVector && len >= 4 && a[0] < bound && a[1] < bound) {
++            if (flt[a[1]] == 1 && a[2] >= 2 && a[2] <= 4) flt[a[0]] = a[2];
++            if (t_bvec[1] && a[1] == t_bvec[1] && a[2] >= 2 && a[2] <= 4) t_bvec[a[2]] = a[0];
++        }
++        else if (op == G_OpTypePointer && len >= 4 && a[0] < bound && a[1] == G_SCOutput) ptee[a[0]] = a[2];
++        else if (op == G_OpVariable && len >= 4 && a[1] < bound && a[2] == G_SCOutput && a[0] < bound) outv[a[1]] = a[0] + 1;   // its pointer type + 1
++        else if (op == G_OpFunction && first_fn == nw) first_fn = i;
++        i += len;
++    }
++    if (model != G_ExecFragment || !t_f32 || first_fn == nw || !at_mm) { snprintf(err, errn, "none"); goto fail; }
++    // The colour outputs: Output variables with a Location (not built-ins); their chains, and the stores of a float value through either
++    for (uint32_t v = 1; v < bound; v++) if (outv[v] && (!loc[v] || bi[v])) outv[v] = 0;
++    uint32_t *derived = outv;   // (reused: a pointer id into a colour output + 1 = its pointer type + 1)
++    for (size_t i = first_fn; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if ((op == G_OpAccessChain || op == G_OpInBoundsAccessChain) && len >= 4 && a[2] < bound && derived[a[2]] && a[1] < bound) derived[a[1]] = a[0] + 1;
++        else if (op == G_OpStore && len >= 3 && a[0] < bound && derived[a[0]]) { uint32_t pt = derived[a[0]] - 1, t = pt < bound ? ptee[pt] : 0; if (t && t < bound && flt[t]) nstore++; }
++        i += len;
++    }
++    if (!nstore) { snprintf(err, errn, "none"); goto fail; }
++    // New ids: the bool vector types, per float type used its 0 / -1e30 / 1e30 constants, the GLSL import
++    uint32_t nb = bound, n_glsl = 0, nbool[5] = {0}, cst[5][3] = {{0}}, lo = 0, hi = 0;   // cst[n]: zero, lo, hi of the n-component type
++    uint32_t tf[5] = {0}; tf[1] = t_f32;
++    for (uint32_t t = 1; t < bound; t++) if (flt[t] >= 2 && !tf[flt[t]]) tf[flt[t]] = t;
++    if (!glsl) glsl = n_glsl = nb++;
++    if (!t_bvec[1]) t_bvec[1] = nbool[1] = nb++;
++    for (int n = 2; n <= 4; n++) if (tf[n] && !t_bvec[n]) t_bvec[n] = nbool[n] = nb++;
++    lo = nb++; hi = nb++;
++    for (int n = 1; n <= 4; n++) if (tf[n]) { cst[n][0] = nb++; cst[n][1] = n == 1 ? lo : nb++; cst[n][2] = n == 1 ? hi : nb++; }
++    uint32_t sid = nb; nb += (uint32_t)nstore * 3;
++    if (!gput_n(&o, w, 5)) GFAIL("out of memory");
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (i == at_mm && n_glsl) {   // OpExtInstImport goes before the memory model
++            static const char nm[16] = "GLSL.std.450";
++            uint32_t im[6] = {GW(G_OpExtInstImport, 6), n_glsl}; memcpy(im + 2, nm, 16); if (!gput_n(&o, im, 6)) GFAIL("out of memory");
++        }
++        if (i == first_fn) {   // the new types and constants, before the first function
++            if (nbool[1]) { uint32_t t[2] = {GW(G_OpTypeBool, 2), nbool[1]}; if (!gput_n(&o, t, 2)) GFAIL("out of memory"); }
++            for (int n = 2; n <= 4; n++) if (nbool[n]) { uint32_t t[4] = {GW(G_OpTypeVector, 4), nbool[n], t_bvec[1], (uint32_t)n}; if (!gput_n(&o, t, 4)) GFAIL("out of memory"); }
++            uint32_t c[8] = {GW(G_OpConstant, 4), t_f32, lo, 0xf149f2cau, GW(G_OpConstant, 4), t_f32, hi, 0x7149f2cau};   // -1e30, 1e30
++            if (!gput_n(&o, c, 8)) GFAIL("out of memory");
++            for (int n = 1; n <= 4; n++) if (tf[n]) {
++                uint32_t z[3] = {GW(G_OpConstantNull, 3), tf[n], cst[n][0]}; if (!gput_n(&o, z, 3)) GFAIL("out of memory");
++                if (n > 1) for (int k = 1; k <= 2; k++) {
++                    uint32_t cc[7] = {GW(G_OpConstantComposite, 3 + n), tf[n], cst[n][k], k == 1 ? lo : hi, k == 1 ? lo : hi, k == 1 ? lo : hi, k == 1 ? lo : hi};
++                    if (!gput_n(&o, cc, 3 + n)) GFAIL("out of memory");
++                }
++            }
++        }
++        if (op == G_OpStore && len >= 3 && a[0] < bound && derived[a[0]]) {
++            uint32_t pt = derived[a[0]] - 1, t = pt < bound ? ptee[pt] : 0, n = t && t < bound ? flt[t] : 0;
++            if (n >= 1 && n <= 4 && tf[n] == t) {
++                uint32_t isn[4] = {GW(G_OpIsNan, 4), t_bvec[n], sid, a[1]},
++                         cl[8] = {GW(G_OpExtInst, 8), t, sid + 1, glsl, G_FClamp, a[1], cst[n][1], cst[n][2]},
++                         se[6] = {GW(G_OpSelect, 6), t, sid + 2, sid, cst[n][0], sid + 1};
++                if (!gput_n(&o, isn, 4) || !gput_n(&o, cl, 8) || !gput_n(&o, se, 6)) GFAIL("out of memory");
++                size_t at = o.n; if (!gput_n(&o, w + i, len)) GFAIL("out of memory");
++                o.w[at + 2] = sid + 2; sid += 3; i += len; continue;
++            }
++        }
++        if (!gput_n(&o, w + i, len)) GFAIL("out of memory");
++        i += len;
++    }
++    if (sid > nb) GFAIL("id bound overrun (%u > %u)", sid, nb);
++    o.w[3] = nb;
++    free(ptee); free(outv); free(flt); free(loc); free(bi);
++    *out_nw = o.n;
++    snprintf(err, errn, "%zu float colour stores guarded", nstore);
++    return o.w;
++fail:
++    free(ptee); free(outv); free(flt); free(loc); free(bi); free(o.w);
++    return NULL;
++#undef GFAIL
++}
 --- a/docs/env_switches.tsv
 +++ b/docs/env_switches.tsv
 @@ -404,6 +404,7 @@
@@ -1028,10 +1178,18 @@
  DM_VK_MESH_IND	switch	`0` (Android, live, on) draws an indirect mesh draw from its NVN2 record itself (x = count, y = first workgroup: nothing drawn) instead of a {count, 1, 1} copy made on the GPU before the pass ([rendering.md](reference/rendering.md#indirect-mesh-draws-drew-nothing))
  DM_VK_MESH_LOG	diagnostic	`1` (Android) logs each task / mesh / pixel shader triple of a mesh draw once, with its first draw's workgroup count and whether the mesh shader has per-primitive outputs
  DM_VK_MESH_PREPASS_SKIP	switch	`0` / `1` (Android, live; unset: on with Qualcomm's driver) the profile's `mesh_prepass_cut` workaround: `0` draws the listed depth-only mesh prepass draws and keeps their colour pass's EQUAL, `1` skips and relaxes them on every driver ([rendering.md](reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver))
-+DM_VK_MESH_SHUFFLE_BCAST	switch	`0` / `1` (Android, restart; default 1 on Qualcomm's driver, 0 elsewhere) task and mesh shaders' subgroup shuffles made of broadcasts and selects over the subgroup (`vka_spvshuf.c`), as Eden does on Qualcomm's driver (`has_broken_spirv_subgroup_shuffle`); `0` the shuffle instruction
++DM_VK_MESH_SHUFFLE_BCAST	switch	`0` / `1` (Android, restart, default 0) `1`: task and mesh shaders' subgroup shuffles made of broadcasts and selects over the subgroup (`vka_spvshuf.c`), as Eden does on Qualcomm's driver (`has_broken_spirv_subgroup_shuffle`)
  DM_VK_MESH_SKIP	diagnostic	`=<mesh key>,...` (Android) skips the mesh draws of those mesh shaders, to find a wrong mesh draw by taking draws away in a replay
  DM_VK_NANSCAN	diagnostic	`1` / `2` (Android, restart, needs push descriptors) after every render pass scans the float colour attachments (and the float storage images each dispatch wrote) for NaN / infinite texels and logs the passes with any (frame, attachment, shaders); `2` also splits passes to find the draw (`DM_VK_NANSCAN_STEP`, `_DRAWS`, `_SERIAL`); not for play
  DM_VK_NANSCAN_BIG	diagnostic	`=<value>` (Android, restart) with `DM_VK_NANSCAN`, finite texels with a channel above that value (absolute) count as infinite: to find the pass or draw that first writes out-of-range values (fireflies that bloom spreads)
+@@ -462,6 +464,7 @@
+ DM_VK_NANSCAN_LINES	diagnostic	`=<n>` (Android, restart) with `DM_VK_NANSCAN`, the most result lines logged in a run (default 200)
+ DM_VK_NANSCAN_SERIAL	diagnostic	`=<serial>` (Android, restart) with `DM_VK_NANSCAN=2`, split only passes into the image of that texture serial (default any)
+ DM_VK_NANSCAN_STEP	diagnostic	`=<n>` (Android, restart, default 64) with `DM_VK_NANSCAN=2`, the pass is ended and scanned after every n draws
++DM_VK_NAN_GUARD	switch	`0` (Android, read once, on) pixel shaders' float colour outputs are not guarded; on, each store into one is `isnan(v) ? 0 : clamp(v, -1e30, 1e30)` (`vka_spvguard.c`, Hookshot's GuardFragmentOutputs: one NaN pixel went through the bloom into a white flash); a module whose float outputs feed integer targets is left
+ DM_VK_NDSR	player	`=<n>` (Android, live, default 2) what runs in place of a game's neural upscaler (NDSR, Donkey Kong Bananza): `0` the game's own network, `1` a smooth stretch, `2` FSR 1, `3` nearest neighbor; the launcher sets it from the Upscaler setting
+ DM_VK_NDSR_SHARP	player	`=<stops>` (Android, live, default 0.25) how much FSR sharpens after scaling up in place of the neural upscaler: `0` the most, each stop halves it, below 0 no sharpening
+ DM_VK_OVERLAY	switch	`0` (Android, live, 1) the launcher's overlay (build tag, frame rate and its items) is shown by Android views over the game instead of being drawn by the present into the game's images (`vka_present.c` `ovl_draw`; the views made the app's window draw and the compositor blend a second changing layer, issue #34)
 --- a/dm/host/crash.c
 +++ b/dm/host/crash.c
 @@ -3,6 +3,8 @@
