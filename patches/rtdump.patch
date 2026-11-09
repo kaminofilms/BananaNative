@@ -57,7 +57,55 @@
                  uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
                  R.dnl = nl; R.dext = (VkExtent2D){lw, lh};
                  rt_peek("depth", 0, rt->depth, im, lv, l0, nl);
-@@ -1749,6 +1751,34 @@
+@@ -917,7 +919,7 @@
+ static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
+     VkBuffer b; VkDeviceSize o;
+     uint64_t run = vka_addr_run(addr, size ? size : V.sb_range, &b, &o);
+-    if (!run) { VRED_ONCE("storage buffer at %#llx is not in placed guest RAM: it is not bound", (unsigned long long)addr); return 0; }
++    if (!run) return 0;   // (logged by the caller, sb_unbound)
+     if (run > V.sb_range) run = V.sb_range;
+     *bi = (VkDescriptorBufferInfo){b, o, run}; return 1;
+ }
+@@ -1068,6 +1070,30 @@
+     VLOG("class: shader %016llx stage %d binding %u declares a %s %s, texture ID %d is %s (%s)", (unsigned long long)sh->key, st, r->binding, cn[want], storage ? "image" : "texture", tid, cn[have], why);
+ }
+ static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
++// A storage buffer whose address is not in placed guest RAM is bound null (reads 0): which shader, binding and record it came from, and for an address read from a
++// uniform buffer the 64 bytes around the word it was read at (the CPU's bytes now), the first 48 different (shader, stage, binding) and a count every 600 lines' worth.
++// Hookshot ties this class to Ocarina's black ambient light (a buffer the back end could not bind read 0: the light probes, foliage and signs black)
++static void sb_unbound(const vka_shader *sh, int st, const vka_res *r) {
++    static _Atomic uint64_t seen[256]; static _Atomic int nlog; static _Atomic uint64_t total;
++    uint64_t n = atomic_fetch_add(&total, 1) + 1;
++    uint64_t h = (sh->key ^ (uint64_t)st << 58 ^ (uint64_t)r->binding << 42 ^ (uint64_t)r->elem << 32) | 1;
++    int fresh = 1;
++    for (uint32_t i = (uint32_t)(h ^ h >> 31) & 255, k = 0; k < 256; i = (i + 1) & 255, k++) {
++        uint64_t o = 0; if (atomic_compare_exchange_strong(&seen[i], &o, h)) break;
++        if (o == h) { fresh = 0; break; }
++    }
++    uint64_t vka_frame(void);
++    if (fresh && atomic_fetch_add(&nlog, 1) < 48) {
++        char words[200] = ""; size_t wn = 0;
++        if (r->src) { uint32_t q[16]; uint64_t at = (r->src + r->src_off) & ~31ull;
++            if (cpu_read(at, q, sizeof q)) for (int i = 0; i < 16 && wn < sizeof words - 12; i++) wn += (size_t)snprintf(words + wn, sizeof words - wn, "%s%08x", i ? " " : "", q[i]); }
++        VRED("unbound storage buffer: frame %llu shader %016llx stage %d binding %u[%u] kind %u at %#llx size %#llx%s (uniform buffer slot %d %#llx + %#x; its words from +%#llx: %s)",
++             (unsigned long long)vka_frame(), (unsigned long long)sh->key, st, r->binding, r->elem, r->kind, (unsigned long long)r->addr, (unsigned long long)r->size,
++             r->flags & DMSH_VK_BF_RW ? " written" : " read only", r->src_reg, (unsigned long long)r->src, r->src_off,
++             (unsigned long long)(r->src_off & ~31u), words[0] ? words : "-");
++    }
++    if (!(n & (n - 1)) && n >= 64) VLOG("unbound storage buffers: %llu so far (frame %llu)", (unsigned long long)n, (unsigned long long)vka_frame());
++}
+ // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
+ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
+     for (int i = 0; i < n; i++) {
+@@ -1082,6 +1108,7 @@
+             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+             switch (r[i].what) {
+             case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
++                if (!ok && storage) sb_unbound(sh, st, &r[i]);
+                 if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
+                 if (ok && storage) sb_peek_note(sh->key, st, &r[i]);
+                 if (ok && !storage) ub_peek_note(sh->key, st, &r[i]);
+@@ -1749,6 +1776,34 @@
          vka_nan_inputs(g_cb, ims, bs, ts, m);
      }
      if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
@@ -92,7 +140,7 @@
      if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
      d->b.samples = R.samples;
      vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)
-@@ -1825,6 +1855,7 @@
+@@ -1825,6 +1880,7 @@
          if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
      }
      if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
@@ -100,7 +148,7 @@
      PT(5);
      int istart = 0; uint32_t i_wv = 0, i_wp = 0; int64_t i_d = 0; vka_span i_ta = {0}, i_aa = {0};
      if (ijoin || (icand && g_ia.valid)) {
-@@ -2249,6 +2280,11 @@
+@@ -2249,6 +2305,11 @@
          for (int i = 0; i < g_wk.n[5] && m < 32; i++) if (g_wk.r[5][i].what == VKA_R_IMG && g_wk.r[5][i].tid) ims[m++] = vka_tex_id_img(g_wk.r[5][i].tid, g_cb);
          vka_nan_dispatch(g_cb, sh[5]->key, ims, m);
      }
@@ -320,6 +368,35 @@
              vka_texmod_key tk = {fs ? (k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant) : DMSH_VK_MOD_BASE, order[i] == 0 ? k->vin_u : 0, order[i] == 0 ? k->vin_s : 0,
                                   fu, fsm, frz ? gl : -1, k->tex_u[rg], k->tex_s[rg]};
              VkShaderModule t = order[i] == 2 && k->gs_fx ? VK_NULL_HANDLE : vka_shader_tex_module(s, &tk);
+--- a/dm/gfx/vk_android/vka_bind.c
++++ b/dm/gfx/vk_android/vka_bind.c
+@@ -73,6 +73,7 @@
+             case DMSH_VK_KIND_SBUF_UBO: {
+                 uint64_t a = noslot ? 0 : ubo_word(s, st, reg, b->off, 8, rd, ctx);
+                 if (a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
++                if (!noslot && reg >= 0 && reg < 16) { r.src = s->ubo[st][reg].addr; r.src_off = b->off; r.src_reg = (int8_t)reg; }
+                 break; }
+             case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
+                 int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)))
+@@ -106,6 +107,7 @@
+                 else if (dev_align && (r.addr & (dev_align - 1)))
+                     return refuse(why, whyn, "storage buffer (binding %u, slot %d) at %#llx is not %llu-byte aligned (a library built before ssbo_align)", b->binding, reg, (unsigned long long)r.addr, (unsigned long long)dev_align);
+             }
++            r.kind = b->kind;
+             out[n++] = r;
+         }
+     }
+--- a/dm/gfx/vk_android/vka_bind.h
++++ b/dm/gfx/vk_android/vka_bind.h
+@@ -47,6 +47,8 @@
+     int16_t bank;                      // VKA_R_DRV
+     int32_t tid, sid;
+     uint64_t addr, size;
++    uint64_t src;                      // DMSH_VK_KIND_SBUF_UBO: the uniform buffer the address was read from (src + src_off), for the unbound-buffer log
++    uint16_t src_off; int8_t src_reg; uint8_t kind;
+ } vka_res;
+ 
+ // Reads guest memory for handles kept in uniform buffers (TEX_UBO, SAMP_UBO, SBUF_UBO): 1 = read, 0 = not readable (the value reads as 0)
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_rtdump.c
 @@ -0,0 +1,273 @@
