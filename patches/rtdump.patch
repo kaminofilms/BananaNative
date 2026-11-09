@@ -4,7 +4,7 @@
      uint32_t inst_bind;                 // an instanced variant: the uniform binding it was made for + 1 (the prewarm list records it with the base key)
      struct vka_gslink *gslink;          // a geometry shader's modules with outputs added for a pixel shader's inputs, by vertex / pixel pair (vka_shader_gs_link_module)
      uint8_t fcomp[8];                   // a pixel shader: the components of each colour output its module can write (vka_spv_fout_comps), for the write mask; all 0xf when not read
-+    VkShaderModule fin_keep[5]; int fin_keep_none;   // a pixel shader in a mesh pipeline: its modules with the input arrays left unsplit, by variant (vka_shader_fin_keep_module)
++    struct vka_finlink *finlink; int fin_none;   // a pixel shader's modules with its input arrays split for a previous stage, by stage and variant (vka_shader_fin_link_module); fin_none: it has none
      uint64_t chash;                     // its library entry's hash (vka_shlib_entry_hash), for the pipeline cache's stamp (vka_pso.c); 0 = not in the library
  } vka_shader;
  // An instanced variant's key (vka_draw.c's instanced runs): its base shader's key XOR this. It is no key of the shader library, and the variant depends on the uniform
@@ -12,7 +12,7 @@
  VkShaderModule vka_shader_gs_link_module(vka_shader *gs, vka_shader *vs, vka_shader *fs, int claim);   // with the pixel inputs it does not write added (VK_NULL_HANDLE: none to add)
  #define VKA_GS_CLAIM_BINDING (DMSH_VK_STAGE_GS * DMSH_VK_STAGE_BINDINGS + DMSH_VK_STAGE_BINDINGS - 1)   // set 0: the claim words of such a shader (the stage's last binding)
  VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t smask);
-+VkShaderModule vka_shader_fin_keep_module(vka_shader *s, int variant);   // a pixel shader's module for a mesh pipeline, its input arrays unsplit; VK_NULL_HANDLE: it has none (the usual module)
++VkShaderModule vka_shader_fin_link_module(vka_shader *fs, vka_shader *pre, int variant);   // a pixel shader's module with its input arrays split for the stage before it (a vertex pipeline); VK_NULL_HANDLE: the usual module
  typedef struct { int variant; uint32_t vin_u, vin_s, fout_u, fout_s; int frz; uint64_t tex_u, tex_s; } vka_texmod_key;   // variant: DMSH_VK_MOD_*; frz: -1 or the folded GL depth
  VkShaderModule vka_shader_tex_module(vka_shader *s, const vka_texmod_key *k);   // that stage module (vin / fout retypes, the fold) with its textures at tex_u / tex_s retyped; VK_NULL_HANDLE = refused (logged)
  int vka_shader_tex_range(const vka_shader *s);   // the stage's binding range (set 0 bindings range * DMSH_VK_STAGE_BINDINGS + n)
@@ -165,34 +165,40 @@
      VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
      VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
      free(w);
-@@ -268,6 +286,32 @@
+@@ -268,6 +286,38 @@
      pthread_mutex_unlock(&g_mu);
      return mod;
  }
-+// A pixel shader drawn with a mesh shader: its module with indexed input arrays left as the translator wrote them (vka_spvsplit.c splits them for vertex pipelines,
-+// whose stages now all write separate outputs; a mesh shader's outputs are left as they are, and the Adreno 840 driver crashed making a mesh pipeline with the split
-+// pixel module). VK_NULL_HANDLE when the shader has no such array (then its usual module is the same) or the module fails (logged)
-+VkShaderModule vka_shader_fin_keep_module(vka_shader *s, int variant) {
-+    if (variant < 0 || variant > DMSH_VK_MOD_SHUFFLE_LDS || s->fin_keep_none) return VK_NULL_HANDLE;
-+    if (s->fin_keep[variant]) return s->fin_keep[variant];
-+    const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, variant);
-+    if (!m) return VK_NULL_HANDLE;
-+    char err[256]; size_t nb = 0;
-+    vka_spv_fin_keep = 1; uint32_t *w = vka_shlib_spirv(s->lib, m, &nb, err, sizeof err); vka_spv_fin_keep = 0;
-+    if (!w) return VK_NULL_HANDLE;
-+    char why[160]; size_t on = 0; uint32_t *t = vka_spv_fin_split(w, nb / 4, &on, why, sizeof why);
-+    if (!t) { free(w); if (!strcmp(why, "none")) s->fin_keep_none = 1; return VK_NULL_HANDLE; }   // nothing split: the usual module
-+    free(t);
-+    if (s->e->flags & DMSH_VK_F_SUBGROUP) single_lane(s->key, s->e->stage, &w, &nb);
-+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
-+    VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
-+    free(w);
-+    if (r) { VRED("pixel shader %016llx for a mesh pipeline: vkCreateShaderModule %d", (unsigned long long)s->key, r); return VK_NULL_HANDLE; }
++// A pixel shader in a vertex pipeline: its module with indexed input arrays split into one input per location the stage before it writes (vka_spv_fin_split; the
++// elements it does not write read 0). The translator declares such inputs as one vec4 array while the vertex stage writes separate vec4s, and the Adreno 840 driver reads
++// that array as zeros (Ocarina of Time's probe prefilter 62b2ec7b555ad8a8: black probe cube, black shadows); splitting it into all 16 locations, 10 of them unwritten by
++// the vertex shader, crashed the driver making the pipeline (rtdump8/9), so only the written ones become inputs. Made once per stage / variant, kept for the process.
++// VK_NULL_HANDLE: no such array (DM_VK_FIN_SPLIT=0: never split), or not made (logged): the usual module
++static uint32_t *base_words(vka_shader *s, size_t *nb, char *err, size_t errn);
++struct vka_finlink { struct vka_finlink *next; uint64_t pre; int variant; VkShaderModule mod; };
++VkShaderModule vka_shader_fin_link_module(vka_shader *fs, vka_shader *pre, int variant) {
++    static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_FIN_SPLIT", 1);
++    if (!on || !fs || !pre || fs->fin_none || variant < 0 || variant > DMSH_VK_MOD_SHUFFLE_LDS) return VK_NULL_HANDLE;
 +    pthread_mutex_lock(&g_mu);
-+    if (s->fin_keep[variant]) { pthread_mutex_unlock(&g_mu); vk.vkDestroyShaderModule(V.dev, mod, NULL); return s->fin_keep[variant]; }
-+    s->fin_keep[variant] = mod;
++    for (struct vka_finlink *l = fs->finlink; l; l = l->next) if (l->pre == pre->key && l->variant == variant) { VkShaderModule m = l->mod; pthread_mutex_unlock(&g_mu); return m; }
 +    pthread_mutex_unlock(&g_mu);
-+    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("pixel shader %016llx in a mesh pipeline: its input arrays left unsplit (as the mesh shader writes them)", (unsigned long long)s->key);
++    char err[256] = "", why[200] = ""; size_t fn = 0, pn = 0, on_ = 0; VkShaderModule mod = VK_NULL_HANDLE; uint64_t mask = 0;
++    const dmsh_vk_module *m = vka_shlib_module(fs->lib, fs->e, variant);
++    uint32_t *f = m ? vka_shlib_spirv(fs->lib, m, &fn, err, sizeof err) : NULL, *p = f ? base_words(pre, &pn, err, sizeof err) : NULL, *o = NULL;
++    if (p) { mask = vka_spv_out_locs(p, pn / 4); o = vka_spv_fin_split(f, fn / 4, mask ? mask : 1ull << 63, &on_, why, sizeof why); }
++    if (f && p && !o && !strcmp(why, "none")) { fs->fin_none = 1; free(f); free(p); return VK_NULL_HANDLE; }   // no array: nothing to do for any stage
++    if (o && (fs->e->flags & DMSH_VK_F_SUBGROUP)) { size_t ob = on_ * 4; single_lane(fs->key, fs->e->stage, &o, &ob); on_ = ob / 4; }
++    if (o) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = on_ * 4, .pCode = o};
++             VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod); if (r) { snprintf(err, sizeof err, "vkCreateShaderModule %d", r); mod = VK_NULL_HANDLE; } }
++    free(f); free(p); free(o);
++    if (mod) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VLOG("pixel shader %016llx with %016llx: %s (inputs at %#llx; DM_VK_FIN_SPLIT=0 leaves them)", (unsigned long long)fs->key, (unsigned long long)pre->key, why, (unsigned long long)mask); }
++    else { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("pixel shader %016llx with %016llx: input arrays not split (%s): the module as it is", (unsigned long long)fs->key, (unsigned long long)pre->key, err[0] ? err : why); }
++    pthread_mutex_lock(&g_mu);
++    for (struct vka_finlink *l = fs->finlink; l; l = l->next) if (l->pre == pre->key && l->variant == variant) {
++        VkShaderModule had = l->mod; pthread_mutex_unlock(&g_mu); if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL); return had; }
++    struct vka_finlink *l = malloc(sizeof *l);
++    if (l) { *l = (struct vka_finlink){fs->finlink, pre->key, variant, mod}; fs->finlink = l; }
++    pthread_mutex_unlock(&g_mu);
 +    return mod;
 +}
  // A geometry shader that writes memory, with those writes made by one run per primitive (vka_spv_gs_claim: the Adreno 840 runs a geometry shader several times for each
@@ -219,37 +225,37 @@
 +    // location (vka_spvsplit.c): Adreno reads such an array against the vertex stage's separate outputs as zeros (Ocarina's probe prefilter, black shadows)
 +    static int split = -1; if (split < 0) { const char *e = getenv("DM_VK_FIN_SPLIT"); split = !e || atoi(e) != 0; }
 +    if (split) {
-+        char why[160]; size_t on = 0; uint32_t *o = vka_spv_fin_split(w, nb / 4, &on, why, sizeof why);
++        char why[160]; size_t on = 0; uint32_t *o = vka_spv_fin_split(w, nb / 4, 0, &on, why, sizeof why);   // (pixel shaders: per pipeline, vka_shader_fin_link_module)
 +        if (o) {
-+            static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 12) fprintf(stderr, "[dm] [vk] pixel shader inputs: %s (%zu -> %zu bytes; DM_VK_FIN_SPLIT=0 leaves them)\n", why, nb, on * 4);
++            static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 12) fprintf(stderr, "[dm] [vk] shader outputs: %s (%zu -> %zu bytes; DM_VK_FIN_SPLIT=0 leaves them)\n", why, nb, on * 4);
 +            free(w); w = o; nb = on * 4;
-+        } else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] pixel shader inputs not split: %s (the module as it is)\n", why); }
++        } else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] shader outputs not split: %s (the module as it is)\n", why); }
 +    }
 +    if (nbytes) *nbytes = nb;
      return w;
  }
 --- a/dm/gfx/vk_android/vka_spvpatch.h
 +++ b/dm/gfx/vk_android/vka_spvpatch.h
-@@ -29,3 +29,9 @@
+@@ -29,3 +29,8 @@
  uint32_t *vka_spv_gs_link(const uint32_t *gw, size_t gn, const uint32_t *vw, size_t vn, const uint32_t *fw, size_t fn, uint32_t *copied, uint32_t *nulled, size_t *out_nw, char *err, size_t errn);
  // A pixel shader's colour outputs: the components each location's stores can write (bit c of comp[loc]), for the colour write mask: 0, or -1 when the module is not read
  int vka_spv_fout_comps(const uint32_t *w, size_t nw, uint8_t comp[8]);
-+// vka_spvsplit.c: a pixel shader's indexed Input array of vec4 split into one Input per location, the array made Private and filled at the entry (Adreno reads
-+// such an array against a vertex stage's separate outputs as zeros). NULL with err "none" when the module has no such array
-+uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn);
-+// Set on a thread while it makes a pixel module for a mesh pipeline (vka_shader_fin_keep_module): its input arrays are left as they are ("none"). A mesh shader writes
-+// its outputs as the translator always did, and the Adreno 840 driver crashed making a mesh pipeline with a split pixel shader (2026-11-09)
-+extern _Thread_local int vka_spv_fin_keep;
++// vka_spvsplit.c: a stage's indexed interface array of vec4 split into one variable per location. Pixel shaders: an Input array, only for a pipeline, with in_mask the
++// locations the previous stage writes (vka_spv_out_locs): those become inputs, the other elements read 0 (in_mask 0: pixel shaders are left). Vertex, tessellation
++// evaluation and geometry shaders: an Output array (in_mask ignored). NULL with err "none" when nothing changes
++uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, uint64_t in_mask, size_t *out_nw, char *err, size_t errn);
++uint64_t vka_spv_out_locs(const uint32_t *w, size_t nw);   // the locations a pre-rasterization module writes, bit per location
 --- a/dm/gfx/vk_android/vka_pso.c
 +++ b/dm/gfx/vk_android/vka_pso.c
-@@ -365,12 +365,19 @@
+@@ -365,12 +365,20 @@
              if (lm) mod = lm;
          }
          if (!mod) return 0;
-+        int fin_keep = 0;   // a mesh pipeline's pixel shader: its input arrays unsplit (vka_shader_fin_keep_module), without the output or texture retypes
-+        if (fs && mesh) {
-+            VkShaderModule km = vka_shader_fin_keep_module(s, k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant);
-+            if (km) { if (mod != vka_shader_module(s, k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant)) VRED_ONCE("%016llx: a mesh pipeline's pixel module with unsplit inputs, without its output retype", (unsigned long long)s->key);
++        int fin_keep = 0;   // a vertex pipeline's pixel shader: its input arrays split for the last stage before it (vka_shader_fin_link_module), without the output or texture retypes
++        if (fs && !mesh && last_pre >= 0 && sh[last_pre]) {
++            int fv = k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant;
++            VkShaderModule km = vka_shader_fin_link_module(s, sh[last_pre], fv);
++            if (km) { if (mod != vka_shader_module(s, fv)) VRED_ONCE("%016llx: a pixel module with split inputs, without its output retype", (unsigned long long)s->key);
 +                      mod = km; fin_keep = 1; }
 +        }
          // A task or mesh module that reads its subgroup lanes, with its specialization constants folded in instead of VkSpecializationInfo (vka_shader_spec_module)
@@ -258,7 +264,7 @@
          // Float textures and images bound to integer texture views (vka_draw.c tex_masks): the module above with them retyped (vka_shader_tex_module); not with the geometry claim
          int rg = vka_shader_tex_range(s);
 -        if (rg >= 0 && rg < 5 && (k->tex_u[rg] | k->tex_s[rg])) {
-+        if (fin_keep && rg >= 0 && rg < 5 && (k->tex_u[rg] | k->tex_s[rg])) VRED_ONCE("%016llx: a mesh pipeline's pixel module with unsplit inputs, without its texture retype", (unsigned long long)s->key);
++        if (fin_keep && rg >= 0 && rg < 5 && (k->tex_u[rg] | k->tex_s[rg])) VRED_ONCE("%016llx: a pixel module with split inputs, without its texture retype", (unsigned long long)s->key);
 +        else if (rg >= 0 && rg < 5 && (k->tex_u[rg] | k->tex_s[rg])) {
              vka_texmod_key tk = {fs ? (k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant) : DMSH_VK_MOD_BASE, order[i] == 0 ? k->vin_u : 0, order[i] == 0 ? k->vin_s : 0,
                                   fu, fsm, frz ? gl : -1, k->tex_u[rg], k->tex_s[rg]};
@@ -541,7 +547,7 @@
 +#endif
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_spvsplit.c
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,261 @@
 +// vka_spv_fin_split: a stage's indexed interface array split into one variable per location (plain C, no Vulkan).
 +//
 +// The translator declares the user attributes a shader reads or writes through an indirect attribute access (Maxwell ALD / AST / IPA with a register index) as one
@@ -582,9 +588,7 @@
 +typedef struct { uint32_t id, sc, pointee; } sptr;
 +typedef struct { uint32_t var, arr, n, loc, base, pptr; uint32_t decs[8][3]; int ndec; } starget;   // base: the first of its n new variable ids
 +
-+_Thread_local int vka_spv_fin_keep;
-+
-+uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn) {
++uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, uint64_t in_mask, size_t *out_nw, char *err, size_t errn) {
 +#define SFAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
 +    uint32_t *loc = NULL, *arr_elem = NULL, *arr_len = NULL, *cval = NULL, *isvar = NULL, *derived = NULL, *ctype = NULL;
 +    sptr *ptrs = NULL; size_t nptr = 0, cptr = 0;
@@ -599,7 +603,7 @@
 +    for (size_t i = 5; i < nw;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) SFAIL("bad instruction at word %zu", i);
 +        if (op == S_OpEntryPoint && len >= 3) { model = w[i + 1]; entry_fn = w[i + 2]; ep_at = i; break; } i += len; }
 +    if (model != S_ExecFragment && model != S_ExecVertex && model != S_ExecTessEval && model != S_ExecGeometry) { snprintf(err, errn, "none"); goto fail; }
-+    if (model == S_ExecFragment && vka_spv_fin_keep) { snprintf(err, errn, "none"); goto fail; }   // a mesh pipeline's pixel module
++    if (model == S_ExecFragment && !in_mask) { snprintf(err, errn, "none"); goto fail; }   // a pixel shader is split only for a pipeline (the previous stage's outputs)
 +    int outside = model != S_ExecFragment;   // outputs, copied out
 +    uint32_t sc_io = outside ? S_SCOutput : S_SCInput;
 +    // Pass 1: types, constants, pointers, locations, the interface variables of that side
@@ -641,6 +645,8 @@
 +        tg[ntg] = (starget){v, pointee, n, loc[v], 0, 0, {{0}}, 0}; ntg++;
 +    }
 +    if (!ntg) { snprintf(err, errn, "none"); goto fail; }
++    #define USED(T, K) (outside || ((T).loc + (K) < 64 && (in_mask >> ((T).loc + (K)) & 1)))   // an element the previous stage writes: an input of its own
++    int nnull = 0; for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (!USED(tg[t], k)) nnull++;
 +    // The interpolation decorations of each array (Flat, NoPerspective, Centroid, Sample: copied to each of its variables)
 +    for (size_t i = 5; i < first_fn;) {
 +        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
@@ -656,6 +662,7 @@
 +        if (!OUT) { if (nnew >= 64) SFAIL("too many pointer types"); OUT = nb++; newptr[nnew][0] = OUT; newptr[nnew][1] = (SC); newptr[nnew][2] = (PT); nnew++; } } while (0)
 +    uint32_t p_io_v4, p_priv_v4; FINDPTR(sc_io, t_v4f, p_io_v4); FINDPTR(S_SCPrivate, t_v4f, p_priv_v4);
 +    for (int t = 0; t < ntg; t++) { FINDPTR(S_SCPrivate, tg[t].arr, tg[t].pptr); tg[t].base = nb; nb += tg[t].n; }
++    uint32_t cnull = nnull ? nb++ : 0;   // vec4(0): the elements no input feeds (Qualcomm's driver fails a pipeline whose pixel inputs the previous stage does not write)
 +    uint32_t cidx[32] = {0}, newc[32]; int nnewc = 0; uint32_t maxn = 0, tot = 0; for (int t = 0; t < ntg; t++) { if (tg[t].n > maxn) maxn = tg[t].n; tot += tg[t].n; }
 +    for (uint32_t k = 0; k < maxn; k++) {
 +        for (uint32_t c = 1; c < bound && !cidx[k]; c++) if (ctype[c] == t_int && cval[c] == k) cidx[k] = c;
@@ -709,13 +716,13 @@
 +            size_t at = o.n; if (!sput(&o, 0)) SFAIL("out of memory");
 +            if (!sput_n(&o, w + i + 1, nm - 1)) SFAIL("out of memory");
 +            for (size_t k = 0; k < niface; k++) { int is_t = 0; for (int t = 0; t < ntg; t++) if (iface[k] == tg[t].var) is_t = 1; if ((!is_t || keep_private) && !sput(&o, iface[k])) SFAIL("out of memory"); }
-+            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (!sput(&o, tg[t].base + k)) SFAIL("out of memory");
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (USED(tg[t], k) && !sput(&o, tg[t].base + k)) SFAIL("out of memory");
 +            o.w[at] = OPW(S_OpEntryPoint, o.n - at); skip = 1;
 +        } else if (op == S_OpDecorate && len >= 3) {
 +            for (int t = 0; t < ntg; t++) if (a[0] == tg[t].var) {
 +                skip = 1;
 +                if (a[1] == S_DecLocation)
-+                    for (uint32_t k = 0; k < tg[t].n; k++) {
++                    for (uint32_t k = 0; k < tg[t].n; k++) if (USED(tg[t], k)) {
 +                        uint32_t d[4] = {OPW(S_OpDecorate, 4), tg[t].base + k, S_DecLocation, tg[t].loc + k}; if (!sput_n(&o, d, 4)) SFAIL("out of memory");
 +                        for (int e = 0; e < tg[t].ndec; e++) { uint32_t dd[4] = {OPW(S_OpDecorate, tg[t].decs[e][2]), tg[t].base + k, tg[t].decs[e][0], tg[t].decs[e][1]}; if (!sput_n(&o, dd, tg[t].decs[e][2])) SFAIL("out of memory"); }
 +                    }
@@ -730,13 +737,15 @@
 +        if (i == first_fn) {   // the new globals, before the first function
 +            for (int q = 0; q < nnew; q++) { uint32_t p[4] = {OPW(S_OpTypePointer, 4), newptr[q][0], newptr[q][1], newptr[q][2]}; if (!sput_n(&o, p, 4)) SFAIL("out of memory"); }
 +            for (int q = 0; q < nnewc; q++) { uint32_t c[4] = {OPW(S_OpConstant, 4), t_int, cidx[newc[q]], newc[q]}; if (!sput_n(&o, c, 4)) SFAIL("out of memory"); }
-+            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) { uint32_t v[4] = {OPW(S_OpVariable, 4), p_io_v4, tg[t].base + k, sc_io}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
++            if (cnull) { uint32_t z[3] = {OPW(46, 3), t_v4f, cnull}; if (!sput_n(&o, z, 3)) SFAIL("out of memory"); }   // OpConstantNull
++            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (USED(tg[t], k)) { uint32_t v[4] = {OPW(S_OpVariable, 4), p_io_v4, tg[t].base + k, sc_io}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
 +        }
 +        if (op == S_OpFunction && len >= 5) { in_entry = a[1] == entry_fn; past_label = 0; }
 +        if (!outside && in_entry && !copied && past_label && op != S_OpVariable && op != S_OpLine && op != S_OpNoLine) {   // inputs: into the array, after the entry block's variables
 +            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) {
-+                uint32_t ld[4] = {OPW(S_OpLoad, 4), t_v4f, id, tg[t].base + k}, ac[5] = {OPW(S_OpAccessChain, 5), p_priv_v4, id + 1, tg[t].var, cidx[k]}, st[3] = {OPW(S_OpStore, 3), id + 1, id};
-+                if (!sput_n(&o, ld, 4) || !sput_n(&o, ac, 5) || !sput_n(&o, st, 3)) SFAIL("out of memory");
++                int u = USED(tg[t], k);
++                uint32_t ld[4] = {OPW(S_OpLoad, 4), t_v4f, id, tg[t].base + k}, ac[5] = {OPW(S_OpAccessChain, 5), p_priv_v4, id + 1, tg[t].var, cidx[k]}, st[3] = {OPW(S_OpStore, 3), id + 1, u ? id : cnull};
++                if ((u && !sput_n(&o, ld, 4)) || !sput_n(&o, ac, 5) || !sput_n(&o, st, 3)) SFAIL("out of memory");
 +                id += 2;
 +            }
 +            copied = 1;
@@ -759,12 +768,44 @@
 +    if (o.w[3] < copy_ids) o.w[3] = copy_ids;
 +    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs);
 +    *out_nw = o.n;
-+    snprintf(err, errn, "%s: %d %s array(s) split into %u variables", model == S_ExecFragment ? "pixel" : model == S_ExecVertex ? "vertex" : model == S_ExecGeometry ? "geometry" : "tessellation evaluation",
-+             ntg, outside ? "output" : "input", tot);
++    tot -= (uint32_t)nnull;
++    snprintf(err, errn, nnull ? "%s: %d %s array(s) split into %u variables, %d more locations the previous stage does not write read as 0" : "%s: %d %s array(s) split into %u variables", model == S_ExecFragment ? "pixel" : model == S_ExecVertex ? "vertex" : model == S_ExecGeometry ? "geometry" : "tessellation evaluation",
++             ntg, outside ? "output" : "input", tot, nnull);
 +    return o.w;
 +fail:
 +    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs); free(o.w);
 +    return NULL;
 +#undef SFAIL
 +#undef FINDPTR
++#undef USED
++}
++
++// The locations a vertex / tessellation evaluation / geometry module's entry point writes (its Output variables with a Location; an array of N covers N): bit per location
++uint64_t vka_spv_out_locs(const uint32_t *w, size_t nw) {
++    if (nw < 5 || w[0] != 0x07230203) return 0;
++    uint32_t bound = w[3]; uint64_t m = 0;
++    uint32_t *loc = calloc(bound, 4), *vt = calloc(bound, 4), *pt = calloc(bound, 4), *alen = calloc(bound, 4), *cv = calloc(bound, 4), *ael = calloc(bound, 4), *ism = calloc(bound, 4);
++    if (!loc || !vt || !pt || !alen || !cv || !ael || !ism) goto done;
++    for (uint32_t i = 0; i < bound; i++) loc[i] = ~0u;
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (!len || i + len > nw) break;
++        if (op == S_OpFunction) break;
++        if (op == S_OpDecorate && len >= 4 && a[1] == S_DecLocation && a[0] < bound) loc[a[0]] = a[2];
++        else if (op == S_OpTypePointer && len >= 4 && a[0] < bound && a[1] == S_SCOutput) pt[a[0]] = a[2] + 1;
++        else if (op == S_OpTypeArray && len >= 4 && a[0] < bound) { alen[a[0]] = a[2]; ael[a[0]] = a[1] + 1; }
++        else if (op == S_OpConstant && len >= 4 && a[1] < bound) cv[a[1]] = a[2];
++        else if (op == S_OpVariable && len >= 4 && a[2] == S_SCOutput && a[1] < bound && a[0] < bound) vt[a[1]] = a[0] + 1;
++        i += len;
++    }
++    for (uint32_t v = 1; v < bound; v++) {
++        if (!vt[v] || loc[v] == ~0u) continue;
++        uint32_t p = vt[v] - 1, t = pt[p] ? pt[p] - 1 : 0, n = 1;
++        if (t && t < bound && ael[t] && alen[t] < bound) { n = cv[alen[t]]; uint32_t e = ael[t] - 1; if (e < bound && ael[e]) n = 1; }   // a geometry / tess array of vertices: one location (no arrays of arrays here)
++        if (n < 1 || n > 64) n = 1;
++        for (uint32_t k = 0; k < n; k++) if (loc[v] + k < 64) m |= 1ull << (loc[v] + k);
++    }
++done:
++    free(loc); free(vt); free(pt); free(alen); free(cv); free(ael); free(ism);
++    return m;
 +}
