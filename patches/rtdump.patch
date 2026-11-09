@@ -135,7 +135,20 @@
      { int tb = VKA_ENV("DM_VK_ENC_TAIL", 16384); atomic_store_explicit(&g_tail_every, tb <= 0 ? 0 : tb > (1 << 20) ? (1u << 20) : (uint32_t)tb, memory_order_relaxed); }   // live: from this submission
 --- a/dm/gfx/vk_android/vka_shader.c
 +++ b/dm/gfx/vk_android/vka_shader.c
-@@ -226,11 +226,29 @@
+@@ -73,6 +73,12 @@
+     int want = ev && *ev ? atoi(ev) != 0 : V.driver_id == VK_DRIVER_ID_MESA_TURNIP;
+     int fits = V.props.limits.maxComputeSharedMemorySize >= DMSH_VK_SHARED_MAX;
+     g_shuffle_lds = want && fits;
++    // Task and mesh shaders' subgroup shuffles made of broadcasts and selects on Qualcomm's driver, as Eden does (vka_spvshuf.c; Ocarina of Time's foliage depth passes
++    // drew spikes, into the shadow maps too). DM_VK_MESH_SHUFFLE_BCAST (restart): 0 = the instruction; default 1 on VK_DRIVER_ID_QUALCOMM_PROPRIETARY, 0 elsewhere
++    {   uint32_t lanes = g_sg_one[DMSH_VK_STAGE_MS] ? 0 : g_sg_pin[DMSH_VK_STAGE_MS] ? g_sg_pin[DMSH_VK_STAGE_MS] : V.subgroup_size;
++        int bc = VKA_ENV("DM_VK_MESH_SHUFFLE_BCAST", V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
++        vka_spv_bcast_lanes = bc && V.mesh && lanes >= 2 && lanes <= 128 ? lanes : 0;
++        if (V.mesh) VLOG("task and mesh subgroup shuffles: %s", vka_spv_bcast_lanes ? "broadcasts and selects over the subgroup (DM_VK_MESH_SHUFFLE_BCAST=0: the instruction)" : "the instruction (DM_VK_MESH_SHUFFLE_BCAST=1: broadcasts)"); }
+     VLOG("compute subgroup shuffles: %s", g_shuffle_lds ? "through workgroup memory where the library has the module (DM_VK_SHUFFLE_LDS=0: the instruction)"
+          : want ? "the instruction (the device's shared memory is under DMSH_VK_SHARED_MAX)" : "the instruction (DM_VK_SHUFFLE_LDS=1: through workgroup memory)");
+ }
+@@ -226,11 +232,29 @@
                                                              stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
      free(*w); *w = o; *nb = on * 4;
  }
@@ -165,7 +178,7 @@
      VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
      VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
      free(w);
-@@ -268,6 +286,38 @@
+@@ -268,6 +292,38 @@
      pthread_mutex_unlock(&g_mu);
      return mod;
  }
@@ -215,7 +228,7 @@
  #include <fcntl.h>
  #include <stdarg.h>
  #include <stdio.h>
-@@ -129,6 +131,17 @@
+@@ -129,6 +131,28 @@
          if (ZSTD_isError(r) || r != m->size) { fail(err, errn, "zstd: %s (%zu of %u bytes)", ZSTD_isError(r) ? ZSTD_getErrorName(r) : "short frame", ZSTD_isError(r) ? 0 : r, m->size); free(w); return NULL; }
      }
      if (w[0] != 0x07230203u) { fail(err, errn, "not SPIR-V (first word %#x)", w[0]); free(w); return NULL; }
@@ -231,12 +244,23 @@
 +            free(w); w = o; nb = on * 4;
 +        } else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] shader outputs not split: %s (the module as it is)\n", why); }
 +    }
++    // Task and mesh modules: subgroup shuffles made of broadcasts on Qualcomm's driver (vka_spv_bcast_lanes, vka_spvshuf.c)
++    if (vka_spv_bcast_lanes) {
++        uint32_t model = ~0u;
++        for (size_t i = 5; i + 1 < nb / 4;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) break; if (op == 15) { model = w[i + 1]; break; } i += len; }
++        if (model == 5364 || model == 5365 || model == 5267 || model == 5268) {   // TaskEXT, MeshEXT, TaskNV, MeshNV
++            char why[160]; size_t on = 0; uint32_t *o = vka_spv_shuffle_bcast(w, nb / 4, vka_spv_bcast_lanes, &on, why, sizeof why);
++            if (o) { static _Atomic int logged; if (atomic_fetch_add(&logged, 1) < 8) fprintf(stderr, "[dm] [vk] %s shader: %s (%zu -> %zu bytes; DM_VK_MESH_SHUFFLE_BCAST=0 leaves them)\n", model == 5364 || model == 5267 ? "task" : "mesh", why, nb, on * 4);
++                     free(w); w = o; nb = on * 4; }
++            else if (strcmp(why, "none")) { static _Atomic int bad; if (atomic_fetch_add(&bad, 1) < 4) fprintf(stderr, "[dm] [vk] [RED] mesh shader shuffles not rewritten: %s (the module as it is)\n", why); }
++        }
++    }
 +    if (nbytes) *nbytes = nb;
      return w;
  }
 --- a/dm/gfx/vk_android/vka_spvpatch.h
 +++ b/dm/gfx/vk_android/vka_spvpatch.h
-@@ -29,3 +29,8 @@
+@@ -29,3 +29,12 @@
  uint32_t *vka_spv_gs_link(const uint32_t *gw, size_t gn, const uint32_t *vw, size_t vn, const uint32_t *fw, size_t fn, uint32_t *copied, uint32_t *nulled, size_t *out_nw, char *err, size_t errn);
  // A pixel shader's colour outputs: the components each location's stores can write (bit c of comp[loc]), for the colour write mask: 0, or -1 when the module is not read
  int vka_spv_fout_comps(const uint32_t *w, size_t nw, uint8_t comp[8]);
@@ -244,7 +268,11 @@
 +// locations the previous stage writes (vka_spv_out_locs): those become inputs, the other elements read 0 (in_mask 0: pixel shaders are left). Vertex, tessellation
 +// evaluation and geometry shaders: an Output array (in_mask ignored). NULL with err "none" when nothing changes
 +uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, uint64_t in_mask, size_t *out_nw, char *err, size_t errn);
-+uint64_t vka_spv_out_locs(const uint32_t *w, size_t nw);   // the locations a pre-rasterization module writes, bit per location
++uint64_t vka_spv_out_locs(const uint32_t *w, size_t nw);
++// vka_spvshuf.c: every subgroup shuffle of a module made of broadcasts over `lanes` lanes and selects (Qualcomm's driver computes the shuffle wrong; Eden never emits it
++// there). NULL with err "none" when the module has none. vka_spv_bcast_lanes: the lanes task and mesh modules get it with (0: off), set by vka_shader.c's shuffle_plan
++uint32_t *vka_spv_shuffle_bcast(const uint32_t *w, size_t nw, uint32_t lanes, size_t *out_nw, char *err, size_t errn);
++extern uint32_t vka_spv_bcast_lanes;   // the locations a pre-rasterization module writes, bit per location
 --- a/dm/gfx/vk_android/vka_pso.c
 +++ b/dm/gfx/vk_android/vka_pso.c
 @@ -365,12 +365,20 @@
@@ -867,6 +895,125 @@
 +    free(loc); free(vt); free(pt); free(alen); free(cv); free(ael); free(ism);
 +    return m;
 +}
+--- /dev/null
++++ b/dm/gfx/vk_android/vka_spvshuf.c
+@@ -0,0 +1,116 @@
++// vka_spv_shuffle_bcast: a module's subgroup shuffles made of broadcasts and selects (plain C, no Vulkan).
++//
++// Qualcomm's Adreno driver computes OpGroupNonUniformShuffle wrong; Eden (and yuzu before it) never emits the instruction there (has_broken_spirv_subgroup_shuffle =
++// driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, emit_spirv_warp.cpp ShuffleAbsolute) and reads the source lane as a select over a broadcast of every lane. Ocarina of
++// Time's foliage mesh shaders on the Adreno 840 (Qualcomm's driver 0x8034a02c) drew their depth-only passes as spikes, also into the shadow maps (hard black shapes on
++// the ground and wrong light on Link); Nova NX2 (Eden-based, the shuffle never emitted) draws the same scene right.
++// Here, the same rewrite on the SPIR-V: each OpGroupNonUniformShuffle (and ShuffleXor / Up / Down, whose source lane is the invocation's SubgroupLocalInvocationId XOR,
++// minus or plus their operand) becomes
++//   r = Broadcast(value, 0); for k in 1..lanes-1: r = Select(src == k, Broadcast(value, k), r)
++// with the shuffle's own scope, result type and result id. A source outside 0..lanes-1 reads lane 0 (undefined for the instruction too). The caller picks the modules:
++// task and mesh shaders on Qualcomm's driver (vka_shlib.c). Needs SPIR-V 1.4 for a vector result (a Select of vectors on a scalar condition): otherwise left.
++// No change: NULL with err "none"
++#include "vka_spvpatch.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++enum { Q_OpCapability = 17, Q_OpEntryPoint = 15, Q_OpTypeBool = 20, Q_OpTypeInt = 21, Q_OpTypeVector = 23, Q_OpTypePointer = 32, Q_OpConstant = 43, Q_OpFunction = 54,
++       Q_OpVariable = 59, Q_OpLoad = 61, Q_OpDecorate = 71, Q_OpIAdd = 128, Q_OpISub = 130, Q_OpBitwiseXor = 198, Q_OpSelect = 169, Q_OpIEqual = 170,
++       Q_OpShuffle = 345, Q_OpShuffleXor = 346, Q_OpShuffleUp = 347, Q_OpShuffleDown = 348, Q_OpBroadcast = 337 };
++enum { Q_CapGroupNonUniformBallot = 64, Q_DecBuiltIn = 11, Q_BISubgroupLocalInvocationId = 41, Q_SCInput = 1 };
++
++uint32_t vka_spv_bcast_lanes;
++
++typedef struct { uint32_t *w; size_t n, cap; } qv_t;
++static int qput(qv_t *v, uint32_t x) {
++    if (v->n == v->cap) { size_t c = v->cap ? 2 * v->cap : 8192; uint32_t *p = realloc(v->w, c * 4); if (!p) return 0; v->w = p; v->cap = c; }
++    v->w[v->n++] = x; return 1;
++}
++static int qput_n(qv_t *v, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) if (!qput(v, x[i])) return 0; return 1; }
++#define QW(op, len) ((uint32_t)(len) << 16 | (uint32_t)(op))
++static int is_global_decl(uint32_t op) { return (op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == Q_OpVariable || op == 322 || op == 4456 || op == 5341 || op == 5281; }
++
++uint32_t *vka_spv_shuffle_bcast(const uint32_t *w, size_t nw, uint32_t lanes, size_t *out_nw, char *err, size_t errn) {
++#define QFAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
++    qv_t o = {0}; uint32_t *vec = NULL, *cu = NULL;
++    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
++    if (lanes < 2 || lanes > 128) { snprintf(err, errn, "none"); return NULL; }
++    uint32_t bound = w[3], version = w[1];
++    vec = calloc(bound, 4); cu = calloc(bound, 4);   // vec: a vector type's component count; cu: a 32-bit unsigned constant's value + 1
++    if (!vec || !cu) QFAIL("out of memory");
++    uint32_t t_bool = 0, t_u32 = 0, lid = 0, p_in_u32 = 0; int has_ballot = 0; size_t nshuf = 0, nrel = 0, first_fn = nw, first_decl = nw, first_cap = 0;
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (!len || i + len > nw) QFAIL("bad instruction at word %zu", i);
++        if (op == Q_OpCapability && len >= 2) { if (!first_cap) first_cap = i; if (a[0] == Q_CapGroupNonUniformBallot) has_ballot = 1; }
++        else if (op == Q_OpTypeBool && len >= 2) t_bool = a[0];
++        else if (op == Q_OpTypeInt && len >= 4 && a[1] == 32 && a[2] == 0) t_u32 = a[0];
++        else if (op == Q_OpTypeVector && len >= 4 && a[0] < bound) vec[a[0]] = a[2];
++        else if (op == Q_OpTypePointer && len >= 4 && a[1] == Q_SCInput && a[2] == t_u32 && t_u32) p_in_u32 = a[0];
++        else if (op == Q_OpConstant && len == 4 && a[0] == t_u32 && t_u32 && a[1] < bound && a[2] < lanes) cu[a[1]] = a[2] + 1;
++        else if (op == Q_OpDecorate && len >= 4 && a[1] == Q_DecBuiltIn && a[2] == Q_BISubgroupLocalInvocationId) lid = a[0];
++        else if (op == Q_OpFunction && first_fn == nw) first_fn = i;
++        else if (op >= Q_OpShuffle && op <= Q_OpShuffleDown && len == 6) {
++            if (vec[a[0]] && version < 0x10400) { snprintf(err, errn, "none"); goto fail; }   // a vector shuffle before SPIR-V 1.4: left
++            nshuf++; if (op != Q_OpShuffle) nrel++;
++        }
++        if (first_decl == nw && first_fn == nw && is_global_decl(op)) first_decl = i;
++        i += len;
++    }
++    if (!nshuf) { snprintf(err, errn, "none"); goto fail; }
++    if (!first_cap || first_fn == nw || first_decl == nw) QFAIL("no capability, global or function section");
++    // New ids: bool / uint types, the lane constants the module lacks, the invocation's lane (an Input variable and its pointer type) for the relative shuffles
++    uint32_t nb = bound, nt_bool = 0, nt_u32 = 0, nlid = 0, np_in = 0, ck[128] = {0}; int newk[128] = {0};
++    if (!t_bool) t_bool = nt_bool = nb++;
++    if (!t_u32) t_u32 = nt_u32 = nb++;
++    for (uint32_t c = 1; c < bound; c++) if (cu[c] && !ck[cu[c] - 1]) ck[cu[c] - 1] = c;
++    for (uint32_t k = 0; k < lanes; k++) if (!ck[k]) { ck[k] = nb++; newk[k] = 1; }
++    if (nrel && !lid) { lid = nlid = nb++; if (!p_in_u32) p_in_u32 = np_in = nb++; }
++    uint32_t sid = nb; nb += (uint32_t)nshuf * (3 * lanes + 2);
++    if (!qput_n(&o, w, 5)) QFAIL("out of memory");
++    for (size_t i = 5; i < nw;) {
++        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++        if (i == first_decl && nlid) { uint32_t d[4] = {QW(Q_OpDecorate, 4), nlid, Q_DecBuiltIn, Q_BISubgroupLocalInvocationId}; if (!qput_n(&o, d, 4)) QFAIL("out of memory"); }
++        if (i == first_fn) {   // the new globals, before the first function
++            if (nt_bool) { uint32_t t[2] = {QW(Q_OpTypeBool, 2), nt_bool}; if (!qput_n(&o, t, 2)) QFAIL("out of memory"); }
++            if (nt_u32) { uint32_t t[4] = {QW(Q_OpTypeInt, 4), nt_u32, 32, 0}; if (!qput_n(&o, t, 4)) QFAIL("out of memory"); }
++            for (uint32_t k = 0; k < lanes; k++) if (newk[k]) { uint32_t c[4] = {QW(Q_OpConstant, 4), t_u32, ck[k], k}; if (!qput_n(&o, c, 4)) QFAIL("out of memory"); }
++            if (np_in) { uint32_t p[4] = {QW(Q_OpTypePointer, 4), np_in, Q_SCInput, t_u32}; if (!qput_n(&o, p, 4)) QFAIL("out of memory"); }
++            if (nlid) { uint32_t v[4] = {QW(Q_OpVariable, 4), p_in_u32, nlid, Q_SCInput}; if (!qput_n(&o, v, 4)) QFAIL("out of memory"); }
++        }
++        if (op == Q_OpEntryPoint && nlid) {   // an Input variable is part of every entry point's interface
++            size_t at = o.n; if (!qput_n(&o, w + i, len) || !qput(&o, nlid)) QFAIL("out of memory");
++            o.w[at] = QW(Q_OpEntryPoint, len + 1);
++        } else if (op >= Q_OpShuffle && op <= Q_OpShuffleDown && len == 6) {
++            uint32_t rt = a[0], res = a[1], scope = a[2], val = a[3], src = a[4];
++            if (op != Q_OpShuffle) {   // the source lane from the invocation's own
++                uint32_t ld[4] = {QW(Q_OpLoad, 4), t_u32, sid, lid}; if (!qput_n(&o, ld, 4)) QFAIL("out of memory");
++                uint32_t bop = op == Q_OpShuffleXor ? Q_OpBitwiseXor : op == Q_OpShuffleUp ? Q_OpISub : Q_OpIAdd;
++                uint32_t ar[5] = {QW(bop, 5), t_u32, sid + 1, sid, a[4]}; if (!qput_n(&o, ar, 5)) QFAIL("out of memory");
++                src = sid + 1;
++            }
++            sid += 2;
++            uint32_t r = sid++; { uint32_t b[6] = {QW(Q_OpBroadcast, 6), rt, r, scope, val, ck[0]}; if (!qput_n(&o, b, 6)) QFAIL("out of memory"); }
++            for (uint32_t k = 1; k < lanes; k++) {
++                uint32_t bk = sid++, ek = sid++, rk = k == lanes - 1 ? res : sid++;
++                uint32_t b[6] = {QW(Q_OpBroadcast, 6), rt, bk, scope, val, ck[k]}, e[5] = {QW(Q_OpIEqual, 5), t_bool, ek, src, ck[k]}, s[6] = {QW(Q_OpSelect, 6), rt, rk, ek, bk, r};
++                if (!qput_n(&o, b, 6) || !qput_n(&o, e, 5) || !qput_n(&o, s, 6)) QFAIL("out of memory");
++                r = rk;
++            }
++            if (lanes == 1) QFAIL("one lane");
++        } else if (!qput_n(&o, w + i, len)) QFAIL("out of memory");
++        if (i == first_cap && !has_ballot) { uint32_t c[2] = {QW(Q_OpCapability, 2), Q_CapGroupNonUniformBallot}; if (!qput_n(&o, c, 2)) QFAIL("out of memory"); }   // OpGroupNonUniformBroadcast
++        i += len;
++    }
++    if (sid > nb) QFAIL("id bound overrun (%u > %u)", sid, nb);
++    o.w[3] = nb;
++    free(vec); free(cu);
++    *out_nw = o.n;
++    snprintf(err, errn, "%zu subgroup shuffles (%zu relative) made of broadcasts over %u lanes", nshuf, nrel, lanes);
++    return o.w;
++fail:
++    free(vec); free(cu); free(o.w);
++    return NULL;
++#undef QFAIL
++}
 --- a/docs/env_switches.tsv
 +++ b/docs/env_switches.tsv
 @@ -404,6 +404,7 @@
@@ -877,6 +1024,14 @@
  DM_VK_FOUT_COMPS	switch	`0` (Android, live: pixel shaders made from then on, 1) pixel shaders' colour outputs write every component of their targets, as before, instead of only the components the module stores (the others keep the target's value, as Maxwell leaves them)
  DM_VK_FOUT_RETYPE	switch	`=0` (Android): a pixel shader's float output into a UINT / SINT attachment is not retyped (`vka_spv_fout_retype`); that target is not written, the earlier behaviour; default on
  DM_VK_FRAME_RATE	switch	`0` (Android, live, 1) the window is not given the game's frame rate (`ANativeWindow_setFrameRate`, held by `DM_VK_FRAME_RATE_HOLD`); the panel's rate is left to the system
+@@ -452,6 +453,7 @@
+ DM_VK_MESH_IND	switch	`0` (Android, live, on) draws an indirect mesh draw from its NVN2 record itself (x = count, y = first workgroup: nothing drawn) instead of a {count, 1, 1} copy made on the GPU before the pass ([rendering.md](reference/rendering.md#indirect-mesh-draws-drew-nothing))
+ DM_VK_MESH_LOG	diagnostic	`1` (Android) logs each task / mesh / pixel shader triple of a mesh draw once, with its first draw's workgroup count and whether the mesh shader has per-primitive outputs
+ DM_VK_MESH_PREPASS_SKIP	switch	`0` / `1` (Android, live; unset: on with Qualcomm's driver) the profile's `mesh_prepass_cut` workaround: `0` draws the listed depth-only mesh prepass draws and keeps their colour pass's EQUAL, `1` skips and relaxes them on every driver ([rendering.md](reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver))
++DM_VK_MESH_SHUFFLE_BCAST	switch	`0` / `1` (Android, restart; default 1 on Qualcomm's driver, 0 elsewhere) task and mesh shaders' subgroup shuffles made of broadcasts and selects over the subgroup (`vka_spvshuf.c`), as Eden does on Qualcomm's driver (`has_broken_spirv_subgroup_shuffle`); `0` the shuffle instruction
+ DM_VK_MESH_SKIP	diagnostic	`=<mesh key>,...` (Android) skips the mesh draws of those mesh shaders, to find a wrong mesh draw by taking draws away in a replay
+ DM_VK_NANSCAN	diagnostic	`1` / `2` (Android, restart, needs push descriptors) after every render pass scans the float colour attachments (and the float storage images each dispatch wrote) for NaN / infinite texels and logs the passes with any (frame, attachment, shaders); `2` also splits passes to find the draw (`DM_VK_NANSCAN_STEP`, `_DRAWS`, `_SERIAL`); not for play
+ DM_VK_NANSCAN_BIG	diagnostic	`=<value>` (Android, restart) with `DM_VK_NANSCAN`, finite texels with a channel above that value (absolute) count as infinite: to find the pass or draw that first writes out-of-range values (fireflies that bloom spreads)
 --- a/dm/host/crash.c
 +++ b/dm/host/crash.c
 @@ -3,6 +3,8 @@

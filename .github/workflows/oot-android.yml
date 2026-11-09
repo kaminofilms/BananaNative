@@ -111,7 +111,7 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump13 -PnxVersionCode=17 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump14 -PnxVersionCode=18 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Host library symbols (to read crash offsets)
         if: success()
         shell: bash
