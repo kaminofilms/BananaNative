@@ -143,10 +143,42 @@ jobs:
           cp README.md deliverables/
           cp patches/README.md deliverables/CANDIDATE-NOTES.md
           cp patches/oot-mesh-depth.patch patches/rtdump.patch deliverables/
+      - name: Build the same app under Wuthering Waves' application ID (Red Magic RedCore / Game Space game profile)
+        if: success()
+        shell: bash
+        working-directory: upstream/android/app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('build.gradle')
+          s = p.read_text()
+          old = "'dev.kaminofilms.bananative.ootfix'"
+          assert s.count(old) == 1
+          s = s.replace(old, "'com.kurogame.wutheringwaves.global'")
+          assert s.count("nxPlay ? 'Banana OOT Fix'") == 1
+          s = s.replace("nxPlay ? 'Banana OOT Fix'", "nxPlay ? 'Banana OOT WW'")
+          p.write_text(s)
+          PY
+          rm -f out/nxnative-android-play.apk
+          ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump16 -PnxVersionCode=20 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+          mkdir -p "$GITHUB_WORKSPACE/deliverables-ww"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging out/nxnative-android-play.apk > "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
+          grep -q "package: name='com.kurogame.wutheringwaves.global'" "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
+          grep -q "application-label:'Banana OOT WW'" "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
+          ! grep -q "application-debuggable" "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
+          cp out/nxnative-android-play.apk "$GITHUB_WORKSPACE/deliverables-ww/Banana-OOT-WW.apk"
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: banana-oot-side-by-side
           path: deliverables/
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: banana-oot-ww-id
+          path: deliverables-ww/
           retention-days: 14
           if-no-files-found: error
