@@ -57,7 +57,32 @@
                  uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
                  R.dnl = nl; R.dext = (VkExtent2D){lw, lh};
                  rt_peek("depth", 0, rt->depth, im, lv, l0, nl);
-@@ -917,7 +919,7 @@
+@@ -699,6 +701,24 @@
+     else VRED_ONCE("uniform buffer at %#llx is not in placed guest RAM: bound as a copy of the CPU's bytes", (unsigned long long)addr);
+     *bi = (VkDescriptorBufferInfo){s.buf, s.off, size}; return 1;
+ }
++// DM_VK_COPY_KEY=<hex shader key>[,…] (Android, read once): those shaders' uniform buffers (and with DM_VK_COPY_SB=1 their read-only storage buffers up to 1 MiB) are bound
++// as a copy of the CPU's bytes when the draw is recorded, not in place: the GPU then reads what the game had written by its submission, not what it writes after.
++// Ocarina of Time double-buffers its light data (the lighting pass 3687985571c47db6's buffers alternate between two addresses a frame) and the GPU here runs up to
++// 1-2 frames behind it; Link flashes white in single frames. Hookshot captures guest memory at each submission for this game. A GPU write earlier in the submission
++// into such a buffer is missed by the copy (the light list may be one: hence DM_VK_COPY_SB apart)
++static int copy_key(uint64_t key) {
++    static uint64_t keys[32]; static int n = -1;
++    if (n < 0) { int k = 0; const char *e = getenv("DM_VK_COPY_KEY");
++        while (e && *e && k < 32) { char *end; uint64_t v = strtoull(e, &end, 16); if (end == e) break; keys[k++] = v; e = *end ? end + 1 : end; }
++        n = k; if (n) VLOG("uniform buffers of %d shader(s) bound as copies of the CPU's bytes at the draw (DM_VK_COPY_KEY)%s", n, VKA_ENV("DM_VK_COPY_SB", 0) ? ", read-only storage buffers too" : ""); }
++    for (int i = 0; i < n; i++) if (keys[i] == key) return 1;
++    return 0;
++}
++static int copy_desc(uint64_t addr, uint64_t size, uint64_t align, VkDescriptorBufferInfo *bi) {
++    vka_span s; if (!size || !vka_scratch(size, align, &s)) return 0;
++    if (!cpu_read(addr, s.ptr, size)) return 0;
++    *bi = (VkDescriptorBufferInfo){s.buf, s.off, size}; return 1;
++}
+ // DM_VK_SB_PEEK=<hex key>[,…] (diagnostic): the storage buffers those shaders may write, as the CPU sees them when the draw or dispatch is recorded and again once its
+ // submission has completed (vka_draw_peek_commit), to follow sums a shader leaves for the CPU (agl's scene analysis). The first DM_VK_SB_PEEK_LINES (default 200) lines from frame DM_VK_SB_PEEK_FROM (default 0) are logged
+ typedef struct sb_peek { struct sb_peek *next; uint64_t key, addr, size, frame, fence; int st, binding, flags, n; uint32_t w[64]; } sb_peek;
+@@ -917,7 +937,7 @@
  static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
      VkBuffer b; VkDeviceSize o;
      uint64_t run = vka_addr_run(addr, size ? size : V.sb_range, &b, &o);
@@ -66,7 +91,7 @@
      if (run > V.sb_range) run = V.sb_range;
      *bi = (VkDescriptorBufferInfo){b, o, run}; return 1;
  }
-@@ -1068,6 +1070,30 @@
+@@ -1068,6 +1088,30 @@
      VLOG("class: shader %016llx stage %d binding %u declares a %s %s, texture ID %d is %s (%s)", (unsigned long long)sh->key, st, r->binding, cn[want], storage ? "image" : "texture", tid, cn[have], why);
  }
  static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
@@ -97,15 +122,23 @@
  // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
  static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
      for (int i = 0; i < n; i++) {
-@@ -1082,6 +1108,7 @@
+@@ -1081,7 +1125,14 @@
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
              int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
              switch (r[i].what) {
-             case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
+-            case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
++            case VKA_R_BUF:
++                ok = 0;
++                if (copy_key(sh->key)) {
++                    if (!storage) { uint64_t sz = r[i].size && r[i].size <= V.ub_range ? r[i].size : (65536 < V.ub_range ? 65536 : V.ub_range); ok = copy_desc(r[i].addr, sz, V.ub_align, bi); }
++                    else if (VKA_ENV("DM_VK_COPY_SB", 0) && !(r[i].flags & DMSH_VK_BF_RW) && r[i].size && r[i].size <= (1u << 20)) ok = copy_desc(r[i].addr, r[i].size, 256, bi);
++                }
++                if (!ok) ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
 +                if (!ok && storage) sb_unbound(sh, st, &r[i]);
                  if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
                  if (ok && storage) sb_peek_note(sh->key, st, &r[i]);
                  if (ok && !storage) ub_peek_note(sh->key, st, &r[i]);
-@@ -1749,6 +1776,34 @@
+@@ -1749,6 +1800,34 @@
          vka_nan_inputs(g_cb, ims, bs, ts, m);
      }
      if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
@@ -140,7 +173,7 @@
      if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
      d->b.samples = R.samples;
      vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)
-@@ -1825,6 +1880,7 @@
+@@ -1825,6 +1904,7 @@
          if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
      }
      if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
@@ -148,7 +181,7 @@
      PT(5);
      int istart = 0; uint32_t i_wv = 0, i_wp = 0; int64_t i_d = 0; vka_span i_ta = {0}, i_aa = {0};
      if (ijoin || (icand && g_ia.valid)) {
-@@ -2249,6 +2305,11 @@
+@@ -2249,6 +2329,11 @@
          for (int i = 0; i < g_wk.n[5] && m < 32; i++) if (g_wk.r[5][i].what == VKA_R_IMG && g_wk.r[5][i].tid) ims[m++] = vka_tex_id_img(g_wk.r[5][i].tid, g_cb);
          vka_nan_dispatch(g_cb, sh[5]->key, ims, m);
      }
@@ -172,16 +205,8 @@
              memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
          }
      }
-@@ -423,8 +424,15 @@
-     vka_up_flush(); vka_up_throttle();   // before the submission that may use what it made
-     if (!r) r = vka_submit(g_cb, fence, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
+@@ -425,6 +426,7 @@
      g_hrec[fence % NHREC].sub_ns = now_ns();
-+    // DM_VK_SUBMIT_WAIT=1 (diagnostic, read once): each submission is waited for before the replay goes on, so the GPU never reads memory the game wrote after the
-+    // submission (with DM_VK_WORKER=0 the game waits too). Ocarina of Time double-buffers its light data (the lighting pass 3687985571c47db6's bindings alternate
-+    // between two addresses a frame) and Link flashes white for single frames: if this ends it, the GPU read a buffer the game was already rewriting (Hookshot's reason
-+    // to capture memory at each submission). Slow
-+    { static int sw = -1; if (sw < 0) sw = VKA_ENV("DM_VK_SUBMIT_WAIT", 0);
-+      if (sw && !r) { uint64_t q = vka_fence_queued(); if (q) vka_wait_done(q, 500000000ull); } }   // the last fence on the queue (this one may be handed over later)
      g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
      if (vka_nan_on()) vka_nan_commit(fence);
 +    if (vka_rtd_on()) vka_rtd_commit(fence);
@@ -1269,7 +1294,16 @@
  DM_NVN_RT_RANGE	switch	`=1` (experimental, off by default; with `DM_NVN_TBDR=1`) keeps the pass open when the game sets the same colour and depth target again with a view that differs only in its level count
  DM_NVN_RT_RANGE_CHECK	diagnostic	With `DM_NVN_RT_RANGE=1` and `DM_NVN_PASSDUMP`, renders a candidate pass both ways in the same frame and logs and writes the comparison (`CHECK_RESULTS.tsv`, `[RED]` on a difference)
  DM_NVN_SHDUMP	diagnostic	`=<dir>` saves programs missing from the shader map as `<key>.ctl` (control section) and `<key>.code`, to find the files that hold them
-@@ -404,6 +405,7 @@
+@@ -385,6 +386,8 @@
+ DM_VK_CHUNK	switch	`=<n>` (Android, live: the next submission, default 600; `0` one part) a long submission goes to the queue in parts: after n draws of the part in progress it is ended and submitted at the next pass boundary, so the GPU starts while the rest is recorded
+ DM_VK_CHUNK_PASS	switch	`=<n>` (Android, live, default 600; `0` off) a part is also ended and submitted inside an open pass after n draws, when the pass can be split there ([rendering.md](reference/rendering.md#gpu-end-held-back-by-recording-and-a-clocked-down-gpu-on-the-vulkan-replay))
+ DM_VK_CLASSIC_RP	switch	`1` (Android, restart, off; Game settings › Classic render passes) the game's passes as VkRenderPasses begun with imageless framebuffers instead of dynamic rendering, pipelines made against them and without graphics pipeline libraries (less CPU a pass on Qualcomm's driver); needs imagelessFramebuffer
++DM_VK_COPY_KEY	diagnostic	`=<hex shader key>[,…]` (Android, read once) those shaders' uniform buffers are bound as a copy of the CPU's bytes when the draw is recorded, not in place (`vka_draw.c`; Ocarina of Time's double-buffered light data)
++DM_VK_COPY_SB	diagnostic	`1` (Android, live) with `DM_VK_COPY_KEY`, their read-only storage buffers up to 1 MiB too
+ DM_VK_CS_SHARED_OVER	diagnostic	`1` (Android, live, off) makes compute programs whose shared memory exceeds the device's `maxComputeSharedMemorySize` anyway (by default they are not made and their dispatches are skipped); an A/B
+ DM_VK_DISPATCH_LOG	diagnostic	`1` (Android, live: the next frame) logs one line per dispatch (its index in the frame, shader key, groups, workgroup size, shared memory, flags)
+ DM_VK_DISPATCH_SKIP	diagnostic	`=<from>[,<to>]` (Android, live) dispatches from..to of each frame (by `DM_VK_DISPATCH_LOG`'s index; default to the end) are recorded without their `vkCmdDispatch`, to find the one that writes a wrong picture
+@@ -404,6 +407,7 @@
  DM_VK_ENC_TAIL	switch	`=<bytes>` (Android, live: the next submission, 16384; at most 1 MB) the command encoder thread tells the replay thread how far it has got (its tail: a store, a full fence and a load) every that many bytes of calls, when it has caught up and while the replay thread sleeps on it; `0` after every call, as before
  DM_VK_FG	switch	not read as a switch: a prefix in the Vulkan replayer's list of the live run's settings it does not take from a capture (`vka_replay.c`), which covers `DM_VK_FG_REFRESH_CAP`
  DM_VK_FG_REFRESH_CAP	switch	(Android, live, 1) frame generation makes no more images per game frame than the panel's refreshes in the game's period (display timing): on a 60 Hz panel a 60 fps game gets none instead of being held at 30 fps by FIFO; `0` generates the multiplier's count whatever the panel runs at (a driver whose display timing reports a refresh the panel does not run at)
@@ -1277,7 +1311,7 @@
  DM_VK_FOUT_COMPS	switch	`0` (Android, live: pixel shaders made from then on, 1) pixel shaders' colour outputs write every component of their targets, as before, instead of only the components the module stores (the others keep the target's value, as Maxwell leaves them)
  DM_VK_FOUT_RETYPE	switch	`=0` (Android): a pixel shader's float output into a UINT / SINT attachment is not retyped (`vka_spv_fout_retype`); that target is not written, the earlier behaviour; default on
  DM_VK_FRAME_RATE	switch	`0` (Android, live, 1) the window is not given the game's frame rate (`ANativeWindow_setFrameRate`, held by `DM_VK_FRAME_RATE_HOLD`); the panel's rate is left to the system
-@@ -452,6 +454,7 @@
+@@ -452,6 +456,7 @@
  DM_VK_MESH_IND	switch	`0` (Android, live, on) draws an indirect mesh draw from its NVN2 record itself (x = count, y = first workgroup: nothing drawn) instead of a {count, 1, 1} copy made on the GPU before the pass ([rendering.md](reference/rendering.md#indirect-mesh-draws-drew-nothing))
  DM_VK_MESH_LOG	diagnostic	`1` (Android) logs each task / mesh / pixel shader triple of a mesh draw once, with its first draw's workgroup count and whether the mesh shader has per-primitive outputs
  DM_VK_MESH_PREPASS_SKIP	switch	`0` / `1` (Android, live; unset: on with Qualcomm's driver) the profile's `mesh_prepass_cut` workaround: `0` draws the listed depth-only mesh prepass draws and keeps their colour pass's EQUAL, `1` skips and relaxes them on every driver ([rendering.md](reference/rendering.md#depth-only-mesh-prepass-drawn-as-spikes-on-qualcomms-driver))
@@ -1285,7 +1319,7 @@
  DM_VK_MESH_SKIP	diagnostic	`=<mesh key>,...` (Android) skips the mesh draws of those mesh shaders, to find a wrong mesh draw by taking draws away in a replay
  DM_VK_NANSCAN	diagnostic	`1` / `2` (Android, restart, needs push descriptors) after every render pass scans the float colour attachments (and the float storage images each dispatch wrote) for NaN / infinite texels and logs the passes with any (frame, attachment, shaders); `2` also splits passes to find the draw (`DM_VK_NANSCAN_STEP`, `_DRAWS`, `_SERIAL`); not for play
  DM_VK_NANSCAN_BIG	diagnostic	`=<value>` (Android, restart) with `DM_VK_NANSCAN`, finite texels with a channel above that value (absolute) count as infinite: to find the pass or draw that first writes out-of-range values (fireflies that bloom spreads)
-@@ -462,8 +465,10 @@
+@@ -462,8 +467,10 @@
  DM_VK_NANSCAN_LINES	diagnostic	`=<n>` (Android, restart) with `DM_VK_NANSCAN`, the most result lines logged in a run (default 200)
  DM_VK_NANSCAN_SERIAL	diagnostic	`=<serial>` (Android, restart) with `DM_VK_NANSCAN=2`, split only passes into the image of that texture serial (default any)
  DM_VK_NANSCAN_STEP	diagnostic	`=<n>` (Android, restart, default 64) with `DM_VK_NANSCAN=2`, the pass is ended and scanned after every n draws
@@ -1296,14 +1330,6 @@
  DM_VK_OVERLAY	switch	`0` (Android, live, 1) the launcher's overlay (build tag, frame rate and its items) is shown by Android views over the game instead of being drawn by the present into the game's images (`vka_present.c` `ovl_draw`; the views made the app's window draw and the compositor blend a second changing layer, issue #34)
  DM_VK_PACE_LOG	diagnostic	`=<ms>` (Android, live, 5000) a `[vk] pace` line every that many ms: intervals, fps, GPU busy and span p50/p90, the replay's recording and its CPU time, draws, GPU clock floor, ADPF mode, window rate and panel refresh, thermal status and headroom, CPU clocks; `0` off; and a `[vk] pace cost` line: the recording split into draws, texture prepare, submission start, commit and other records, the replay and encoder threads' time on a core, waiting for one and their switches, the encoder's time by kind of call, the draw path by phase (`DM_VK_PACE_PROF`)
  DM_VK_PACE_PROF	diagnostic	`=<n>` (Android, live: the next submission, 16) with `DM_VK_PACE_LOG`, one draw in n is timed by phase for the `[vk] pace cost` line (ten counter reads in such a draw); `0` none (the line then has no draw path part); `DM_VK_PROF=1` times every draw
-@@ -526,6 +531,7 @@
- DM_VK_STRETCH	player	`1` (Android, live, off) the game's picture is stretched over the whole window instead of fitted with its aspect ratio kept (`vka_present_fit.h`); Game settings › Display › Stretch to screen and the in-game panel's Picture › Fit / Stretch set it, per game; the panel's change reaches the running game through `DM_CTL` and the launcher maps touches to the same rectangle
- DM_VK_SUBGROUP_GS	switch	`0` / `1` (Android, restart) `0`: the geometry stage runs one-lane subgroups; `1`: as the device reports; default 0 on Turnip (which computes subgroup operations wrong there), 1 on other drivers
- DM_VK_SUBGROUP_PIN	switch	`=<stage mask>` (Android, restart, default 1 = every stage that can) the stages (`VkShaderStageFlags`) whose subgroup size is pinned to the shader library's; `0` none
-+DM_VK_SUBMIT_WAIT	diagnostic	`1` (Android, read once, off) each submission is waited for before the replay goes on (with `DM_VK_WORKER=0` the game waits too): the GPU never reads memory the game wrote after the submission; slow (`vka_exec.c`; Ocarina of Time's double-buffered light data)
- DM_VK_SWAP_RB	diagnostic	`=<n>` the present's red/blue swap (`vka_present.c vka_swap_rb`; default the profile's `DM_GAME_SWAP_RB`, else 0)
- DM_VK_SYNCLOG	diagnostic	`=<n>` (Android, live, 0 = off) logs the game's next n waits together with each submission's recording and queueing times and timestamp reports (`sync …` lines, one clock in ms)
- DM_VK_TEST_HANG	diagnostic	`=<mode>[,<ticket>]` (Android, restart; ticket default 600) at that present the copy waits for a timeline value no earlier batch signals: mode 1 the next fence, mode 2 a value nothing signals (a sure stall, to test the hang handling)
 --- a/dm/host/crash.c
 +++ b/dm/host/crash.c
 @@ -3,6 +3,8 @@

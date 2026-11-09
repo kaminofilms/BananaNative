@@ -111,7 +111,7 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump19 -PnxVersionCode=23 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump20 -PnxVersionCode=24 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Host library symbols (to read crash offsets)
         if: success()
         shell: bash
@@ -161,7 +161,7 @@ jobs:
           p.write_text(s)
           PY
           rm -f out/nxnative-android-play.apk
-          ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump19 -PnxVersionCode=23 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+          ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump20 -PnxVersionCode=24 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
           mkdir -p "$GITHUB_WORKSPACE/deliverables-ww"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging out/nxnative-android-play.apk > "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
           grep -q "package: name='com.kurogame.wutheringwaves.global'" "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
