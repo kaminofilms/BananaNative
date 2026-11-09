@@ -547,7 +547,7 @@
 +#endif
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_spvsplit.c
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,316 @@
 +// vka_spv_fin_split: a stage's indexed interface array split into one variable per location (plain C, no Vulkan).
 +//
 +// The translator declares the user attributes a shader reads or writes through an indirect attribute access (Maxwell ALD / AST / IPA with a register index) as one
@@ -574,6 +574,7 @@
 +enum { S_OpLine = 8, S_OpEntryPoint = 15, S_OpTypeInt = 21, S_OpTypeFloat = 22, S_OpTypeVector = 23, S_OpTypeArray = 28, S_OpTypePointer = 32, S_OpConstant = 43,
 +       S_OpFunction = 54, S_OpFunctionEnd = 56, S_OpVariable = 59, S_OpLoad = 61, S_OpStore = 62, S_OpAccessChain = 65, S_OpInBoundsAccessChain = 66,
 +       S_OpDecorate = 71, S_OpEmitVertex = 218, S_OpEmitStreamVertex = 220, S_OpLabel = 248, S_OpReturn = 253, S_OpReturnValue = 254, S_OpNoLine = 317 };
++enum { S_OpTypeBool = 20, S_OpConstantNull = 46, S_OpVectorExtractDynamic = 77, S_OpCopyObject = 83, S_OpSelect = 169, S_OpIEqual = 170 };
 +enum { S_DecLocation = 30, S_DecComponent = 31, S_SCInput = 1, S_SCOutput = 3, S_SCPrivate = 6 };
 +enum { S_ExecVertex = 0, S_ExecTessEval = 2, S_ExecGeometry = 3, S_ExecFragment = 4 };
 +
@@ -590,6 +591,7 @@
 +
 +uint32_t *vka_spv_fin_split(const uint32_t *w, size_t nw, uint64_t in_mask, size_t *out_nw, char *err, size_t errn) {
 +#define SFAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
++    uint32_t *ch_t = NULL, *ch_i = NULL, *ch_c = NULL;   // pixel shaders: per access chain id, its array + 1, element index, component index (0: none)
 +    uint32_t *loc = NULL, *arr_elem = NULL, *arr_len = NULL, *cval = NULL, *isvar = NULL, *derived = NULL, *ctype = NULL;
 +    sptr *ptrs = NULL; size_t nptr = 0, cptr = 0;
 +    sv_t o = {0};
@@ -607,13 +609,14 @@
 +    int outside = model != S_ExecFragment;   // outputs, copied out
 +    uint32_t sc_io = outside ? S_SCOutput : S_SCInput;
 +    // Pass 1: types, constants, pointers, locations, the interface variables of that side
-+    uint32_t t_f32 = 0, t_v4f = 0, t_int = 0;
++    uint32_t t_f32 = 0, t_v4f = 0, t_int = 0, t_bool = 0;
 +    for (size_t i = 5; i < nw;) {
 +        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
 +        if (!len || i + len > nw) SFAIL("bad instruction at word %zu", i);
 +        const uint32_t *a = w + i + 1;
 +        if (op == S_OpDecorate && len >= 4 && a[1] == S_DecLocation && a[0] < bound) loc[a[0]] = a[2];
 +        else if (op == S_OpTypeFloat && len >= 3 && a[1] == 32) t_f32 = a[0];
++        else if (op == S_OpTypeBool && len >= 2) t_bool = a[0];
 +        else if (op == S_OpTypeInt && len >= 4 && a[1] == 32) { if (!t_int || !a[2]) t_int = a[0]; }   // a uint32 if there is one
 +        else if (op == S_OpTypeVector && len >= 4 && a[1] == t_f32 && t_f32 && a[2] == 4) t_v4f = a[0];
 +        else if (op == S_OpTypeArray && len >= 4 && a[0] < bound) { arr_elem[a[0]] = a[1]; arr_len[a[0]] = a[2]; }
@@ -701,13 +704,41 @@
 +        }
 +        i += len;
 +    }
++    // Pixel shaders: no array is left to index. Each read of an element (a chain of the array and an element index, or of an index and a component, then a load) becomes
++    // a comparison and select over the inputs: the Adreno 840 compiler crashed on the Private array indexed by the register (rtdump10, 2026-11-09). Anything else: left
++    uint32_t nsel = 0;
++    if (!outside) {
++        ch_t = calloc(bound, 4); ch_i = calloc(bound, 4); ch_c = calloc(bound, 4);
++        if (!ch_t || !ch_i || !ch_c) SFAIL("out of memory");
++        int bad = 0;
++        for (size_t i = first_fn; i < nw && !bad;) {
++            uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++            if ((op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[2] < bound && derived[a[2]]) {
++                int t = -1; for (int q = 0; q < ntg; q++) if (tg[q].var == a[2]) t = q;
++                if (t < 0 || (len != 5 && len != 6) || a[1] >= bound) bad = 1;   // a chain of a chain, or no element index
++                else { ch_t[a[1]] = (uint32_t)t + 1; ch_i[a[1]] = a[3]; ch_c[a[1]] = len == 6 ? a[4] : 0;
++                       if (len == 5 && (a[3] >= bound || !ctype[a[3]] || cval[a[3]] >= tg[t].n)) bad = 1; }   // a whole element by a register: not here
++            }
++            else if (op == S_OpStore && len >= 3 && a[0] < bound && derived[a[0]]) bad = 1;
++            else if (op == S_OpLoad && len >= 4 && a[2] < bound && ch_t[a[2]]) nsel++;
++            i += len;
++        }
++        if (!bad) for (size_t i = first_fn; i < nw && !bad;) {   // a chain used other than by a load (the check above lets chains of chains through)
++            uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
++            for (uint32_t j = 0; j + 1 < len; j++) if (a[j] < bound && ch_t[a[j]] && !(op == S_OpLoad && j == 2) && !((op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && j == 1)) bad = 1;
++            i += len;
++        }
++        if (bad) { snprintf(err, errn, "none"); goto fail; }
++    }
++    uint32_t t_bool_new = 0, cnullf = 0, cnull4 = 0, sel_ids = 0;
++    if (!outside) { if (!t_bool) t_bool = t_bool_new = nb++; cnullf = nb++; cnull4 = cnull ? cnull : nb++; sel_ids = nb; nb += nsel * (4 * maxn + 1); }
 +    if (outside && !sites) SFAIL("no return in the entry point");
 +    if (!outside) sites = 1;
 +    uint32_t copy_ids = nb; nb += 2 * tot * sites;   // per copied element and site: a load and an access chain
 +    // Pass 2: the module written again
 +    if (!sput_n(&o, w, 5)) SFAIL("out of memory");
 +    o.w[3] = nb;
-+    int in_entry = 0, copied = 0, past_label = 0; uint32_t id = copy_ids;
++    int in_entry = 0, copied = !outside, past_label = 0; uint32_t id = copy_ids, sid = sel_ids;
 +    for (size_t i = 5; i < nw;) {
 +        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *a = w + i + 1;
 +        int skip = 0;
@@ -729,6 +760,26 @@
 +            }
 +        } else if (op == S_OpVariable && len >= 4) {
 +            for (int t = 0; t < ntg; t++) if (a[1] == tg[t].var) { uint32_t v[4] = {OPW(S_OpVariable, 4), tg[t].pptr, tg[t].var, S_SCPrivate}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); skip = 1; }
++        } else if (!outside && (op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[1] < bound && ch_t[a[1]]) {
++            skip = 1;   // read at its loads
++        } else if (!outside && op == S_OpLoad && len >= 4 && a[2] < bound && ch_t[a[2]]) {
++            const starget *T = &tg[ch_t[a[2]] - 1]; uint32_t ix = ch_i[a[2]], cc = ch_c[a[2]];
++            if (!cc) {   // a whole element at a constant index
++                uint32_t k = cval[ix];
++                if (USED(*T, k)) { uint32_t ld[4] = {OPW(S_OpLoad, 4), a[0], a[1], T->base + k}; if (!sput_n(&o, ld, 4)) SFAIL("out of memory"); }
++                else { uint32_t cp[4] = {OPW(S_OpCopyObject, 4), a[0], a[1], cnull4}; if (!sput_n(&o, cp, 4)) SFAIL("out of memory"); }
++            } else {   // a component: input k's at that component, where the index is k; 0 where no input is
++                uint32_t r = cnullf;
++                for (uint32_t k = 0; k < T->n; k++) {
++                    if (!USED(*T, k)) continue;
++                    uint32_t ld[4] = {OPW(S_OpLoad, 4), t_v4f, sid, T->base + k}, ex[5] = {OPW(S_OpVectorExtractDynamic, 5), t_f32, sid + 1, sid, cc},
++                             eq[5] = {OPW(S_OpIEqual, 5), t_bool, sid + 2, ix, cidx[k]}, se[6] = {OPW(S_OpSelect, 6), t_f32, sid + 3, sid + 2, sid + 1, r};
++                    if (!sput_n(&o, ld, 4) || !sput_n(&o, ex, 5) || !sput_n(&o, eq, 5) || !sput_n(&o, se, 6)) SFAIL("out of memory");
++                    r = sid + 3; sid += 4;
++                }
++                uint32_t cp[4] = {OPW(S_OpCopyObject, 4), a[0], a[1], r}; if (!sput_n(&o, cp, 4)) SFAIL("out of memory");
++            }
++            skip = 1;
 +        } else if ((op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[2] < bound && derived[a[2]]) {
 +            size_t at = o.n; if (!sput_n(&o, w + i, len)) SFAIL("out of memory");
 +            for (int m = 0; m < nmap; m++) if (chain_map[m][0] == a[0]) o.w[at + 1] = chain_map[m][1];
@@ -738,10 +789,12 @@
 +            for (int q = 0; q < nnew; q++) { uint32_t p[4] = {OPW(S_OpTypePointer, 4), newptr[q][0], newptr[q][1], newptr[q][2]}; if (!sput_n(&o, p, 4)) SFAIL("out of memory"); }
 +            for (int q = 0; q < nnewc; q++) { uint32_t c[4] = {OPW(S_OpConstant, 4), t_int, cidx[newc[q]], newc[q]}; if (!sput_n(&o, c, 4)) SFAIL("out of memory"); }
 +            if (cnull) { uint32_t z[3] = {OPW(46, 3), t_v4f, cnull}; if (!sput_n(&o, z, 3)) SFAIL("out of memory"); }   // OpConstantNull
++            if (t_bool_new) { uint32_t b[2] = {OPW(S_OpTypeBool, 2), t_bool_new}; if (!sput_n(&o, b, 2)) SFAIL("out of memory"); }
++            if (cnullf) { uint32_t z[3] = {OPW(S_OpConstantNull, 3), t_f32, cnullf}, z4[3] = {OPW(S_OpConstantNull, 3), t_v4f, cnull4}; if (!sput_n(&o, z, 3) || (cnull4 != cnull && !sput_n(&o, z4, 3))) SFAIL("out of memory"); }
 +            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (USED(tg[t], k)) { uint32_t v[4] = {OPW(S_OpVariable, 4), p_io_v4, tg[t].base + k, sc_io}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
 +        }
 +        if (op == S_OpFunction && len >= 5) { in_entry = a[1] == entry_fn; past_label = 0; }
-+        if (!outside && in_entry && !copied && past_label && op != S_OpVariable && op != S_OpLine && op != S_OpNoLine) {   // inputs: into the array, after the entry block's variables
++        if (0 && !outside && in_entry && !copied && past_label && op != S_OpVariable && op != S_OpLine && op != S_OpNoLine) {   // (inputs: read at each load instead)
 +            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) {
 +                int u = USED(tg[t], k);
 +                uint32_t ld[4] = {OPW(S_OpLoad, 4), t_v4f, id, tg[t].base + k}, ac[5] = {OPW(S_OpAccessChain, 5), p_priv_v4, id + 1, tg[t].var, cidx[k]}, st[3] = {OPW(S_OpStore, 3), id + 1, u ? id : cnull};
@@ -763,7 +816,8 @@
 +        i += len;
 +    }
 +    if (!copied) SFAIL("the entry point's first block was not found");
-+    if (id > nb) SFAIL("id bound overrun (%u > %u)", id, nb);
++    if (id > nb || sid > nb) SFAIL("id bound overrun (%u > %u)", id > sid ? id : sid, nb);
++    free(ch_t); free(ch_i); free(ch_c); ch_t = ch_i = ch_c = NULL;
 +    o.w[3] = id > copy_ids ? id : nb;   // the ids used (the copy ids were reserved for every site)
 +    if (o.w[3] < copy_ids) o.w[3] = copy_ids;
 +    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs);
@@ -773,6 +827,7 @@
 +             ntg, outside ? "output" : "input", tot, nnull);
 +    return o.w;
 +fail:
++    free(ch_t); free(ch_i); free(ch_c);
 +    free(loc); free(arr_elem); free(arr_len); free(cval); free(isvar); free(derived); free(ctype); free(ptrs); free(o.w);
 +    return NULL;
 +#undef SFAIL
@@ -809,3 +864,13 @@
 +    free(loc); free(vt); free(pt); free(alen); free(cv); free(ael); free(ism);
 +    return m;
 +}
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -404,6 +404,7 @@
+ DM_VK_ENC_TAIL	switch	`=<bytes>` (Android, live: the next submission, 16384; at most 1 MB) the command encoder thread tells the replay thread how far it has got (its tail: a store, a full fence and a load) every that many bytes of calls, when it has caught up and while the replay thread sleeps on it; `0` after every call, as before
+ DM_VK_FG	switch	not read as a switch: a prefix in the Vulkan replayer's list of the live run's settings it does not take from a capture (`vka_replay.c`), which covers `DM_VK_FG_REFRESH_CAP`
+ DM_VK_FG_REFRESH_CAP	switch	(Android, live, 1) frame generation makes no more images per game frame than the panel's refreshes in the game's period (display timing): on a 60 Hz panel a 60 fps game gets none instead of being held at 30 fps by FIFO; `0` generates the multiplier's count whatever the panel runs at (a driver whose display timing reports a refresh the panel does not run at)
++DM_VK_FIN_SPLIT	switch	`=0` leaves indexed shader interface arrays as the translator wrote them; on (default) a vertex / tessellation evaluation / geometry shader's output array of vec4 is split into one output per location, and a pixel shader's input array, in a vertex pipeline, into inputs at the locations the previous stage writes, its indexed reads made compare-and-select (`vka_spvsplit.c`; the Adreno 840 read such arrays as zeros: Ocarina of Time's black shadows)
+ DM_VK_FOUT_COMPS	switch	`0` (Android, live: pixel shaders made from then on, 1) pixel shaders' colour outputs write every component of their targets, as before, instead of only the components the module stores (the others keep the target's value, as Maxwell leaves them)
+ DM_VK_FOUT_RETYPE	switch	`=0` (Android): a pixel shader's float output into a UINT / SINT attachment is not retyped (`vka_spv_fout_retype`); that target is not written, the earlier behaviour; default on
+ DM_VK_FRAME_RATE	switch	`0` (Android, live, 1) the window is not given the game's frame rate (`ANativeWindow_setFrameRate`, held by `DM_VK_FRAME_RATE_HOLD`); the panel's rate is left to the system
