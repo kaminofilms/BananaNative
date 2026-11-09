@@ -117,6 +117,38 @@
      { int bt = VKA_ENV("DM_VK_ENC_BATCH", 4096); g_batch = bt < 0 ? 0 : bt > (1 << 20) ? (1 << 20) : (uint32_t)bt; }   // live: from this submission
      { int us = VKA_ENV("DM_VK_ENC_SPIN", 200); atomic_store_explicit(&g_spin_ns, (uint64_t)(us < 0 ? 0 : us > 100000 ? 100000 : us) * 1000, memory_order_relaxed); }   // live: from this submission
      { int tb = VKA_ENV("DM_VK_ENC_TAIL", 16384); atomic_store_explicit(&g_tail_every, tb <= 0 ? 0 : tb > (1 << 20) ? (1u << 20) : (uint32_t)tb, memory_order_relaxed); }   // live: from this submission
+--- a/dm/gfx/vk_android/vka_shader.c
++++ b/dm/gfx/vk_android/vka_shader.c
+@@ -226,11 +226,29 @@
+                                                             stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
+     free(*w); *w = o; *nb = on * 4;
+ }
++// DM_VK_SHADER_DUMP=<hex key>[,...] (diagnostic, Android, read once): those shaders' modules, as the driver is given them, written to DM_VK_SHADER_DUMP_DIR
++// (default /storage/emulated/0/Download/shaders) as <key>_v<variant>.spv, to read a translated shader off the phone (spirv-dis / spirv-cross)
++static void spv_dump(uint64_t key, unsigned variant, const uint32_t *w, size_t nb) {
++    static const char *keys; static int init;
++    if (!init) { init = 1; keys = getenv("DM_VK_SHADER_DUMP"); if (keys && !*keys) keys = NULL; }
++    if (!keys) return;
++    int hit = 0;
++    for (const char *q = keys; *q && !hit;) { char *e2; unsigned long long k = strtoull(q, &e2, 16); if (e2 == q) break; hit = k == key; q = *e2 == ',' ? e2 + 1 : e2; }
++    if (!hit) return;
++    const char *dir = getenv("DM_VK_SHADER_DUMP_DIR"); if (!dir || !*dir) dir = "/storage/emulated/0/Download/shaders";
++    char b[512]; snprintf(b, sizeof b, "%s", dir);
++    for (char *c = b + 1; *c; c++) if (*c == '/') { *c = 0; mkdir(b, 0775); *c = '/'; }
++    mkdir(b, 0775);
++    char path[600]; snprintf(path, sizeof path, "%s/%016llx_v%u.spv", dir, (unsigned long long)key, variant);
++    FILE *f = fopen(path, "wb"); int ok = f && fwrite(w, 1, nb, f) == nb; if (f) ok = fclose(f) == 0 && ok;
++    VLOG("DM_VK_SHADER_DUMP: shader %016llx variant %u, %zu bytes %s %s", (unsigned long long)key, variant, nb, ok ? "written to" : "NOT written to", path);
++}
+ static VkShaderModule spv_module_(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, const char **why, char *err, size_t errn, uint8_t *fcomp) {
+     size_t nb = 0; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, errn);
+     if (!w) { *why = err; return VK_NULL_HANDLE; }
+     if (fcomp && vka_spv_fout_comps(w, nb / 4, fcomp)) memset(fcomp, 0xf, 8);   // a pixel shader's output components (the colour write mask: vka_draw.c)
+     if (e->flags & DMSH_VK_F_SUBGROUP) single_lane(key, e->stage, &w, &nb);
++    spv_dump(key, m->variant, w, nb);
+     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
+     VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
+     free(w);
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_rtdump.c
 @@ -0,0 +1,273 @@
