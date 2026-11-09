@@ -547,7 +547,7 @@
 +#endif
 --- /dev/null
 +++ b/dm/gfx/vk_android/vka_spvsplit.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,319 @@
 +// vka_spv_fin_split: a stage's indexed interface array split into one variable per location (plain C, no Vulkan).
 +//
 +// The translator declares the user attributes a shader reads or writes through an indirect attribute access (Maxwell ALD / AST / IPA with a register index) as one
@@ -759,7 +759,7 @@
 +                    }
 +            }
 +        } else if (op == S_OpVariable && len >= 4) {
-+            for (int t = 0; t < ntg; t++) if (a[1] == tg[t].var) { uint32_t v[4] = {OPW(S_OpVariable, 4), tg[t].pptr, tg[t].var, S_SCPrivate}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); skip = 1; }
++            for (int t = 0; t < ntg; t++) if (a[1] == tg[t].var) skip = 1;   // made Private after its pointer type, which may be new (below)
 +        } else if (!outside && (op == S_OpAccessChain || op == S_OpInBoundsAccessChain) && len >= 4 && a[1] < bound && ch_t[a[1]]) {
 +            skip = 1;   // read at its loads
 +        } else if (!outside && op == S_OpLoad && len >= 4 && a[2] < bound && ch_t[a[2]]) {
@@ -789,6 +789,9 @@
 +            for (int q = 0; q < nnew; q++) { uint32_t p[4] = {OPW(S_OpTypePointer, 4), newptr[q][0], newptr[q][1], newptr[q][2]}; if (!sput_n(&o, p, 4)) SFAIL("out of memory"); }
 +            for (int q = 0; q < nnewc; q++) { uint32_t c[4] = {OPW(S_OpConstant, 4), t_int, cidx[newc[q]], newc[q]}; if (!sput_n(&o, c, 4)) SFAIL("out of memory"); }
 +            if (cnull) { uint32_t z[3] = {OPW(46, 3), t_v4f, cnull}; if (!sput_n(&o, z, 3)) SFAIL("out of memory"); }   // OpConstantNull
++            // The arrays, now Private, here: their Private pointer types may be new, declared just above (a variable before its type is invalid SPIR-V; Qualcomm's compiler
++            // faulted on it in libllvm-qgl.so, rtdump8-12, 2026-11-09)
++            for (int t = 0; t < ntg; t++) { uint32_t v[4] = {OPW(S_OpVariable, 4), tg[t].pptr, tg[t].var, S_SCPrivate}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
 +            if (t_bool_new) { uint32_t b[2] = {OPW(S_OpTypeBool, 2), t_bool_new}; if (!sput_n(&o, b, 2)) SFAIL("out of memory"); }
 +            if (cnullf) { uint32_t z[3] = {OPW(S_OpConstantNull, 3), t_f32, cnullf}, z4[3] = {OPW(S_OpConstantNull, 3), t_v4f, cnull4}; if (!sput_n(&o, z, 3) || (cnull4 != cnull && !sput_n(&o, z4, 3))) SFAIL("out of memory"); }
 +            for (int t = 0; t < ntg; t++) for (uint32_t k = 0; k < tg[t].n; k++) if (USED(tg[t], k)) { uint32_t v[4] = {OPW(S_OpVariable, 4), p_io_v4, tg[t].base + k, sc_io}; if (!sput_n(&o, v, 4)) SFAIL("out of memory"); }
