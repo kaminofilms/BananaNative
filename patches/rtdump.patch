@@ -41,7 +41,42 @@
                  uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
                  R.dnl = nl; R.dext = (VkExtent2D){lw, lh};
                  rt_peek("depth", 0, rt->depth, im, lv, l0, nl);
-@@ -1825,6 +1827,7 @@
+@@ -1749,6 +1751,34 @@
+         vka_nan_inputs(g_cb, ims, bs, ts, m);
+     }
+     if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
++    {   // DM_VK_DRAW_BIND_LOG=<hex pixel shader key>[,...] (diagnostic, Android, read once): the binding records of those pixel shaders' draws (the first DM_VK_DRAW_BIND_LOG_N,
++        // default 24, in all) for every stage: each texture ID with its texture, view and image, each buffer with its first 16 words as the CPU sees them, and the pass's colour
++        // attachments (serial, level, layer), to follow why a draw's output is wrong (Ocarina's probe pass 62b2ec7b555ad8a8 wrote zeros, DM_VK_RTDUMP 2026-11-09)
++        static const char *dbl; static int dbl_init; uint64_t vka_frame(void);
++        if (!dbl_init) { dbl_init = 1; dbl = getenv("DM_VK_DRAW_BIND_LOG"); if (dbl && !*dbl) dbl = NULL; }
++        if (dbl && sh[1]) {
++            static _Atomic int nb; int hit = 0;
++            for (const char *q = dbl; *q && !hit;) { char *e; unsigned long long k = strtoull(q, &e, 16); if (e == q) break; hit = k == sh[1]->key; q = *e == ',' ? e + 1 : e; }
++            if (hit && atomic_fetch_add(&nb, 1) < VKA_ENV("DM_VK_DRAW_BIND_LOG_N", 24)) {
++                char at[256] = ""; size_t o = 0;
++                for (int i = 0; i < R.nci && o + 48 < sizeof at; i++) if (R.cim[i]) o += (size_t)snprintf(at + o, sizeof at - o, " [%d] serial %llu level %u layer %u", i, (unsigned long long)R.cim[i]->serial, R.clv[i], R.cl0[i]);
++                VLOG("draw bindings: fragment %016llx frame %llu, vertex %016llx, %d colour attachments:%s; depth %llu", (unsigned long long)sh[1]->key, (unsigned long long)vka_frame(),
++                     sh[0] ? (unsigned long long)sh[0]->key : 0ull, R.nci, at, R.dim ? (unsigned long long)R.dim->serial : 0ull);
++                for (int st = 0; st < VKA_NSTAGE; st++) if (sh[st]) for (int i = 0; i < g_wk.n[st]; i++) {
++                    const vka_res *x = &g_wk.r[st][i]; char why[400] = "";
++                    if ((x->what == VKA_R_TEX || x->what == VKA_R_IMG || x->what == VKA_R_TBUF) && x->tid) vka_tex_id_desc(x->tid, why, sizeof why);
++                    else if (x->what == VKA_R_BUF && x->addr) {
++                        uint32_t w[16] = {0}; size_t nn = x->size && x->size < sizeof w ? (size_t)x->size : sizeof w; float f[16];
++                        if (cpu_read(x->addr, w, nn)) { memcpy(f, w, sizeof f);
++                            snprintf(why, sizeof why, "words %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]); }
++                        else snprintf(why, sizeof why, "not readable");
++                    }
++                    VLOG("draw bindings: fragment %016llx stage %d binding %u elem %u what %u desc %u dim %#x flags %#x tid %d sid %d addr %#llx size %#llx %s", (unsigned long long)sh[1]->key, st,
++                         x->binding, x->elem, x->what, x->desc, x->dim, x->flags, x->tid, x->sid, (unsigned long long)x->addr, (unsigned long long)x->size, why);
++                }
++            }
++        }
++    }
+     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
+     d->b.samples = R.samples;
+     vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)
+@@ -1825,6 +1855,7 @@
          if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
      }
      if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
@@ -49,7 +84,7 @@
      PT(5);
      int istart = 0; uint32_t i_wv = 0, i_wp = 0; int64_t i_d = 0; vka_span i_ta = {0}, i_aa = {0};
      if (ijoin || (icand && g_ia.valid)) {
-@@ -2249,6 +2252,11 @@
+@@ -2249,6 +2280,11 @@
          for (int i = 0; i < g_wk.n[5] && m < 32; i++) if (g_wk.r[5][i].what == VKA_R_IMG && g_wk.r[5][i].tid) ims[m++] = vka_tex_id_img(g_wk.r[5][i].tid, g_cb);
          vka_nan_dispatch(g_cb, sh[5]->key, ims, m);
      }
