@@ -54,11 +54,13 @@ jobs:
         run: |
           set -euo pipefail
           cd upstream
-          git apply --check ../patches/oot-mesh-depth.patch
-          git apply ../patches/oot-mesh-depth.patch
+          # The foliage depth patch is held back: the test app crashed in play with it, and the official app has never run it.
+          # To bring it back, restore these two lines and test_vka_mesh_depth below.
+          # git apply --check ../patches/oot-mesh-depth.patch
+          # git apply ../patches/oot-mesh-depth.patch
           git apply --check ../patches/rtdump.patch
           git apply ../patches/rtdump.patch
-          DM_GAME=0400486024DEC000 python3 -m unittest dm.tools.tests.test_vka_mesh_depth dm.tools.tests.test_vka_spec_freeze dm.tools.tests.test_vk_android_abi
+          DM_GAME=0400486024DEC000 python3 -m unittest dm.tools.tests.test_vka_spec_freeze dm.tools.tests.test_vk_android_abi
       - name: Match official play behavior with a separate package
         shell: bash
         run: |
@@ -105,7 +107,7 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump2 -PnxVersionCode=6 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump3 -PnxVersionCode=7 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Package build sources and notices
         if: success()
         shell: bash
