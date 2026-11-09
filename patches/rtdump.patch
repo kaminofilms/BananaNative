@@ -1383,3 +1383,171 @@
  }
  NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
      (void)flags;
+--- a/dm/gfx/tools/dmsh_chain.py
++++ b/dm/gfx/tools/dmsh_chain.py
+@@ -22,7 +22,8 @@
+     'Translation/TranslationFlags.cs', 'Translation/HostCapabilities.cs',
+     'Translation/Transforms/GeometryToCompute.cs', 'Translation/TranslatorContext.cs', 'Translation/Translator.cs', 'Translation/EmitterContext.cs', 'Translation/ShaderDefinitions.cs', 'CodeGen/Spirv/Instructions.cs',
+     'StructuredIr/ShaderProperties.cs', 'Translation/Optimizations/BindlessElimination.cs', 'Translation/Optimizations/Optimizer.cs',
+-    'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs')]
++    'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs',
++    'Instructions/InstEmitFloatArithmetic.cs')]   # (FMUL / FFMA .FMZ, 2026-11-09)
+ INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv']   # in the game profile folder
+ LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
+ STAMP = 'inputs.tsv'   # in the library directory b-<V>/
+--- a/dm/gfx/nvn/dmsh_chain.h
++++ b/dm/gfx/nvn/dmsh_chain.h
+@@ -1,3 +1,3 @@
+ // Generated file (dm/gfx/tools/dmsh_chain.py --header): the B shader library translation chain version this source tree expects (default options), one for every game;
+ // the host loads only <library dir>/b-<V>/. Run dmsh_chain.py --header after changing the chain's tools and commit this file with the change
+-#define DMSH_CHAIN "6eaf449c7ce1"
++#define DMSH_CHAIN "6b41d428a961"
+--- a/dm/gfx/nvn/dmsh_chain_vk.h
++++ b/dm/gfx/nvn/dmsh_chain_vk.h
+@@ -1,5 +1,5 @@
+ // Generated file (dm/gfx/tools/vk_android_build.py --header): the Android Vulkan shader library version this source tree expects. It covers DMSH_CHAIN
+ // (the translator front half), vk_android_build.py, vk_android_spv.py, vk_android_delta.py and dmsh_abi_vk.h; the replay loads <library dir>/v-<V>/dmsh_vk.lib.
+ // DMSH_VK_ABI: what the replay reads of a library (vk_android_delta.py abi_digest); a library of another version with this ABI is played while its update runs
+-#define DMSH_VK_CHAIN "0035e16073bf"
++#define DMSH_VK_CHAIN "c4fdc9c79769"
+ #define DMSH_VK_ABI "228b73bd10f6"
+--- a/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatArithmetic.cs
++++ b/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatArithmetic.cs
+@@ -161,7 +161,7 @@
+             Operand srcB = GetSrcReg(context, op.SrcB);
+             Operand srcC = GetSrcReg(context, op.SrcC);
+ 
+-            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC);
++            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FfmaI(EmitterContext context)
+@@ -172,7 +172,7 @@
+             Operand srcB = GetSrcImm(context, Imm20ToFloat(op.Imm20));
+             Operand srcC = GetSrcReg(context, op.SrcC);
+ 
+-            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC);
++            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FfmaC(EmitterContext context)
+@@ -183,7 +183,7 @@
+             Operand srcB = GetSrcCbuf(context, op.CbufSlot, op.CbufOffset);
+             Operand srcC = GetSrcReg(context, op.SrcC);
+ 
+-            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC);
++            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FfmaRc(EmitterContext context)
+@@ -194,7 +194,7 @@
+             Operand srcB = GetSrcReg(context, op.SrcC);
+             Operand srcC = GetSrcCbuf(context, op.CbufSlot, op.CbufOffset);
+ 
+-            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC);
++            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void Ffma32i(EmitterContext context)
+@@ -205,7 +205,7 @@
+             Operand srcB = GetSrcImm(context, op.Imm32);
+             Operand srcC = GetSrcReg(context, op.Dest);
+ 
+-            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC);
++            EmitFfma(context, Instruction.FP32, srcA, srcB, srcC, op.Dest, op.NegA, op.NegC, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FmulR(EmitterContext context)
+@@ -215,7 +215,7 @@
+             Operand srcA = GetSrcReg(context, op.SrcA);
+             Operand srcB = GetSrcReg(context, op.SrcB);
+ 
+-            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC);
++            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FmulI(EmitterContext context)
+@@ -225,7 +225,7 @@
+             Operand srcA = GetSrcReg(context, op.SrcA);
+             Operand srcB = GetSrcImm(context, Imm20ToFloat(op.Imm20));
+ 
+-            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC);
++            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void FmulC(EmitterContext context)
+@@ -235,7 +235,7 @@
+             Operand srcA = GetSrcReg(context, op.SrcA);
+             Operand srcB = GetSrcCbuf(context, op.CbufSlot, op.CbufOffset);
+ 
+-            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC);
++            EmitFmul(context, Instruction.FP32, op.Scale, srcA, srcB, op.Dest, op.NegA, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void Fmul32i(EmitterContext context)
+@@ -245,7 +245,7 @@
+             Operand srcA = GetSrcReg(context, op.SrcA);
+             Operand srcB = GetSrcImm(context, op.Imm32);
+ 
+-            EmitFmul(context, Instruction.FP32, MultiplyScale.NoScale, srcA, srcB, op.Dest, false, op.Sat, op.WriteCC);
++            EmitFmul(context, Instruction.FP32, MultiplyScale.NoScale, srcA, srcB, op.Dest, false, op.Sat, op.WriteCC, op.Fmz);
+         }
+ 
+         public static void Hadd2R(EmitterContext context)
+@@ -418,14 +418,26 @@
+             bool negateB,
+             bool negateC,
+             bool saturate,
+-            bool writeCC)
++            bool writeCC,
++            Fmz fmz = 0)
+         {
+             bool isFP64 = fpType == Instruction.FP64;
+ 
+             srcB = context.FPNegate(srcB, negateB, fpType);
+             srcC = context.FPNegate(srcC, negateC, fpType);
+ 
+-            Operand res = context.FPSaturate(context.FPFusedMultiplyAdd(srcA, srcB, srcC, fpType), saturate, fpType);
++            Operand res = context.FPFusedMultiplyAdd(srcA, srcB, srcC, fpType);
++
++            // .FMZ: a product with a zero factor is zero whatever the other factor (Inf or NaN times 0 is 0, Direct3D 9's rule), so the sum is C; Eden and yuzu
++            // (floating_point_fused_multiply_add.cpp) do this, this translator did not, and the product was NaN on Vulkan where the console's was 0. Saturation
++            // does the same on its own (NaN saturates to 0), so it is left to it there (as Eden)
++            if (fmz == Fmz.Fmz && !saturate && !isFP64)
++            {
++                Operand zero = context.BitwiseOr(context.FPCompareEqual(srcA, ConstF(0)), context.FPCompareEqual(srcB, ConstF(0)));
++                res = context.ConditionalSelect(zero, srcC, res);
++            }
++
++            res = context.FPSaturate(res, saturate, fpType);
+ 
+             SetDest(context, res, rd, isFP64);
+ 
+@@ -441,7 +453,8 @@
+             int rd,
+             bool negateB,
+             bool saturate,
+-            bool writeCC)
++            bool writeCC,
++            Fmz fmz = 0)
+         {
+             bool isFP64 = fpType == Instruction.FP64;
+ 
+@@ -473,7 +486,16 @@
+                 srcA = context.FPMultiply(srcA, scaleConst, fpType);
+             }
+ 
+-            Operand res = context.FPSaturate(context.FPMultiply(srcA, srcB, fpType), saturate, fpType);
++            Operand res = context.FPMultiply(srcA, srcB, fpType);
++
++            // .FMZ: a zero factor makes the product zero whatever the other (as EmitFfma; Eden's floating_point_multiply.cpp)
++            if (fmz == Fmz.Fmz && !saturate && !isFP64)
++            {
++                Operand zero = context.BitwiseOr(context.FPCompareEqual(srcA, ConstF(0)), context.FPCompareEqual(srcB, ConstF(0)));
++                res = context.ConditionalSelect(zero, ConstF(0), res);
++            }
++
++            res = context.FPSaturate(res, saturate, fpType);
+ 
+             SetDest(context, res, rd, isFP64);
+ 

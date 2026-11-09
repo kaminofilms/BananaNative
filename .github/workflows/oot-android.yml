@@ -109,9 +109,29 @@ jobs:
           s = s.replace(old, old + "\n        debug { storeFile file(System.getenv('NX_DEBUG_KEYSTORE')) }")
           p.write_text(s)
           PY
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build the phone's shader translator from the patched source (Maxwell FMUL / FFMA .FMZ)
+        shell: bash
+        working-directory: upstream/dm/gfx/tools/dmsh_xlate_android
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p "$RUNNER_TEMP/tcbin"; ln -sf "$TC/llvm-objcopy" "$RUNNER_TEMP/tcbin/objcopy"
+          export PATH="$TC:$RUNNER_TEMP/tcbin:$PATH"
+          mkdir -p obj && python3 ../xlate_tree.py > obj/tree.sha && echo "source tree $(cat obj/tree.sha)"
+          rm -rf obj/Release/net10.0/linux-bionic-arm64/native
+          dotnet publish dmsh_xlate_android.csproj -c Release -nologo -o "$RUNNER_TEMP/xl" -p:NativeLib=Shared -p:OutputType=Library
+          ls -la "$RUNNER_TEMP/xl"
+          SO=$(ls "$RUNNER_TEMP"/xl/*.so | head -1)
+          file "$SO" || true
+          cp "$SO" "$GITHUB_WORKSPACE/pack-stage/lib/libdmsh_xlate.so"
+          echo "libdmsh_xlate.so from this tree: $(sha256sum "$GITHUB_WORKSPACE/pack-stage/lib/libdmsh_xlate.so")"
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump20 -PnxVersionCode=24 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-fmz1 -PnxVersionCode=25 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
       - name: Host library symbols (to read crash offsets)
         if: success()
         shell: bash
@@ -161,7 +181,7 @@ jobs:
           p.write_text(s)
           PY
           rm -f out/nxnative-android-play.apk
-          ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump20 -PnxVersionCode=24 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+          ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-fmz1 -PnxVersionCode=25 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
           mkdir -p "$GITHUB_WORKSPACE/deliverables-ww"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging out/nxnative-android-play.apk > "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
           grep -q "package: name='com.kurogame.wutheringwaves.global'" "$GITHUB_WORKSPACE/deliverables-ww/apk-info.txt"
