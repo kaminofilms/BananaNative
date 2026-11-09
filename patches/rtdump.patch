@@ -874,3 +874,38 @@
  DM_VK_FOUT_COMPS	switch	`0` (Android, live: pixel shaders made from then on, 1) pixel shaders' colour outputs write every component of their targets, as before, instead of only the components the module stores (the others keep the target's value, as Maxwell leaves them)
  DM_VK_FOUT_RETYPE	switch	`=0` (Android): a pixel shader's float output into a UINT / SINT attachment is not retyped (`vka_spv_fout_retype`); that target is not written, the earlier behaviour; default on
  DM_VK_FRAME_RATE	switch	`0` (Android, live, 1) the window is not given the game's frame rate (`ANativeWindow_setFrameRate`, held by `DM_VK_FRAME_RATE_HOLD`); the panel's rate is left to the system
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -3,6 +3,8 @@
+ #include "dm.h"
+ #include <signal.h>
+ #include <dlfcn.h>
++#include <string.h>
++#include <pthread.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
+ #include <stdatomic.h>
+@@ -72,9 +74,11 @@
+ #define off crash_off
+ 
+     module_t *m = module_of((void *)a);
+-    Dl_info di;
++    Dl_info di; memset(&di, 0, sizeof di);
+     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
+     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
++    else if (di.dli_fname && di.dli_fbase) {   // a library without the symbol exported (a stripped host or a driver): the library and the offset in it, for llvm-addr2line / nm
++        const char *f = strrchr(di.dli_fname, '/'); fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", f ? f + 1 : di.dli_fname, (unsigned long)(a - (uint64_t)di.dli_fbase)); }
+     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
+ }
+ // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked.
+@@ -205,7 +209,9 @@
+     funlockfile(stderr);
+     fprintf(stderr, "[dm] CRASH sig=%d", sig);
+     off("addr", (uint64_t)si->si_addr); off("pc", PLAT_UC_PC(uc)); off("lr", PLAT_UC_LR(uc));
+-    fprintf(stderr, " sp=%#llx\n", (unsigned long long)PLAT_UC_SP(uc));
++    fprintf(stderr, " sp=%#llx", (unsigned long long)PLAT_UC_SP(uc));
++    { char tn[32] = ""; if (!pthread_getname_np(pthread_self(), tn, sizeof tn) && tn[0]) fprintf(stderr, " thread '%s'", tn); }
++    fprintf(stderr, "\n");
+     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, (unsigned long long)PLAT_UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
+     fprintf(stderr, "\n");
+     // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class

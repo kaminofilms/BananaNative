@@ -111,7 +111,17 @@ jobs:
           PY
       - name: Build foliage depth candidate APK
         working-directory: upstream/android/app
-        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump11 -PnxVersionCode=15 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+        run: ./gradlew --no-daemon -PnxPlay=true -PnxVersion=0.2.4-rtdump12 -PnxVersionCode=16 -PnxPackStage="$GITHUB_WORKSPACE/pack-stage" apk
+      - name: Host library symbols (to read crash offsets)
+        if: success()
+        shell: bash
+        run: |
+          NM=$(ls "$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm 2>/dev/null | head -1)
+          echo "nm: $NM"
+          find upstream -name 'libnxhost_0400486024DEC000.so' -printf '%s %p\n' | sort -n
+          F=$(find upstream -name 'libnxhost_0400486024DEC000.so' -printf '%s %p\n' | sort -n | tail -1 | cut -d' ' -f2)
+          echo "symbols of $F"
+          "$NM" -n --defined-only "$F" | grep -E ' [tTwW] ' | sed 's/^/SYM /' || true
       - name: Package build sources and notices
         if: success()
         shell: bash
